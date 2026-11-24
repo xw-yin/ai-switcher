@@ -8,7 +8,7 @@ use crate::antigravity;
 use crate::codex;
 use crate::models::{
     format_reset_countdown, format_rfc3339_countdown, AccountStore, AntigravityAccount,
-    CodexAccount, Platform,
+    AntigravityIdeAccount, CodexAccount, Platform,
 };
 use crate::store::{
     export_store_to_path, import_accounts_from_path, load_store, save_store, ImportSummary,
@@ -83,6 +83,17 @@ pub fn refresh_store_quotas_blocking() -> Option<AccountStore> {
                 store.active_antigravity_id = Some(found.id.clone());
             }
         }
+        if let Ok(live_ide) = antigravity::fetch_ide_live_status().await {
+            let email = live_ide.email.clone();
+            let _ = antigravity::capture_current_ide_account(&mut store, Some(live_ide));
+            if let Some(found) = store
+                .antigravity_ide_accounts
+                .iter()
+                .find(|a| a.email.eq_ignore_ascii_case(&email))
+            {
+                store.active_antigravity_ide_id = Some(found.id.clone());
+            }
+        }
         let _ = save_store(&store);
         store
     });
@@ -143,6 +154,9 @@ impl MainView {
             Platform::Antigravity => {
                 "已备份当前账号并重启 Antigravity，请在应用中登录新账号...".to_string()
             }
+            Platform::AntigravityIde => {
+                "已备份当前账号并重启 Antigravity IDE，请在 IDE 中登录新账号...".to_string()
+            }
         };
         cx.notify();
 
@@ -162,6 +176,12 @@ impl MainView {
                                     antigravity::login_new_account_and_save(&mut store_clone)
                                         .await?;
                                 format!("授权成功并已保存 Antigravity 账号: {email}")
+                            }
+                            Platform::AntigravityIde => {
+                                let email =
+                                    antigravity::login_new_ide_account_and_save(&mut store_clone)
+                                        .await?;
+                                format!("授权成功并已保存 Antigravity IDE 账号: {email}")
                             }
                         };
                         Ok::<(AccountStore, String), String>((store_clone, msg))
@@ -198,6 +218,7 @@ impl MainView {
         self.status_message = match platform {
             Platform::Codex => "正在捕获当前 Codex 账号...".to_string(),
             Platform::Antigravity => "正在捕获当前 Antigravity 账号...".to_string(),
+            Platform::AntigravityIde => "正在捕获当前 Antigravity IDE 账号...".to_string(),
         };
         cx.notify();
 
@@ -219,6 +240,15 @@ impl MainView {
                                     antigravity::capture_current_account(&mut store_clone, live)?;
                                 save_store(&store_clone)?;
                                 format!("已捕获 Antigravity 账号: {email}")
+                            }
+                            Platform::AntigravityIde => {
+                                let live = antigravity::fetch_ide_live_status().await.ok();
+                                let email = antigravity::capture_current_ide_account(
+                                    &mut store_clone,
+                                    live,
+                                )?;
+                                save_store(&store_clone)?;
+                                format!("已捕获 Antigravity IDE 账号: {email}")
                             }
                         };
                         Ok::<(AccountStore, String), String>((store_clone, msg))
@@ -318,6 +348,8 @@ impl MainView {
                         total.codex_updated += s.codex_updated;
                         total.antigravity_added += s.antigravity_added;
                         total.antigravity_updated += s.antigravity_updated;
+                        total.ide_added += s.ide_added;
+                        total.ide_updated += s.ide_updated;
                     }
                     save_store(&store_clone)?;
                     Ok::<(AccountStore, ImportSummary), String>((store_clone, total))
@@ -387,6 +419,22 @@ impl MainView {
                                 .find(|a| a.email.eq_ignore_ascii_case(&email))
                             {
                                 store_clone.active_antigravity_id = Some(found.id.clone());
+                            }
+                        }
+
+                        // 3. 探测本地运行中的 Antigravity IDE 实时额度并自动同步
+                        if let Ok(live_ide) = antigravity::fetch_ide_live_status().await {
+                            let email = live_ide.email.clone();
+                            let _ = antigravity::capture_current_ide_account(
+                                &mut store_clone,
+                                Some(live_ide),
+                            );
+                            if let Some(found) = store_clone
+                                .antigravity_ide_accounts
+                                .iter()
+                                .find(|a| a.email.eq_ignore_ascii_case(&email))
+                            {
+                                store_clone.active_antigravity_ide_id = Some(found.id.clone());
                             }
                         }
 
@@ -482,6 +530,42 @@ impl MainView {
         .detach();
     }
 
+    fn switch_antigravity_ide(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.status_message = "正在切换 Antigravity IDE 账号并重启 IDE...".to_string();
+        cx.notify();
+
+        let mut store_clone = self.store.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let email = antigravity::switch_ide_account(&mut store_clone, &id)?;
+                    Ok::<(AccountStore, String), String>((store_clone, email))
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                this.busy = false;
+                match result {
+                    Ok((updated, email)) => {
+                        this.store = updated;
+                        this.status_message = format!("已切换 Antigravity IDE 至 {email}");
+                        this.update_tray_title();
+                    }
+                    Err(err) => {
+                        this.status_message = format!("切换失败: {err}");
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn delete_codex(&mut self, id: &str, cx: &mut Context<Self>) {
         self.store.codex_accounts.retain(|a| a.id != id);
         if self.store.active_codex_id.as_deref() == Some(id) {
@@ -500,6 +584,17 @@ impl MainView {
         }
         let _ = save_store(&self.store);
         self.status_message = "已移除 Antigravity 账号".to_string();
+        self.update_tray_title();
+        cx.notify();
+    }
+
+    fn delete_antigravity_ide(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.store.antigravity_ide_accounts.retain(|a| a.id != id);
+        if self.store.active_antigravity_ide_id.as_deref() == Some(id) {
+            self.store.active_antigravity_ide_id = None;
+        }
+        let _ = save_store(&self.store);
+        self.status_message = "已移除 Antigravity IDE 账号".to_string();
         self.update_tray_title();
         cx.notify();
     }
@@ -864,11 +959,167 @@ impl MainView {
 
         card
     }
+
+    fn render_antigravity_ide_card(
+        &self,
+        account: &AntigravityIdeAccount,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_active =
+            self.store.active_antigravity_ide_id.as_deref() == Some(account.id.as_str());
+        let id_switch = account.id.clone();
+        let id_delete = account.id.clone();
+
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .p(px(14.0))
+            .rounded(px(10.0))
+            .bg(if is_active {
+                rgb(BG_CARD_ACTIVE)
+            } else {
+                rgb(BG_CARD)
+            })
+            .border_1()
+            .border_color(if is_active {
+                rgb(BORDER_ACTIVE)
+            } else {
+                rgb(BORDER_SUBTLE)
+            });
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .size(px(8.0))
+                            .rounded(px(4.0))
+                            .bg(if is_active {
+                                rgb(ACCENT_GREEN)
+                            } else {
+                                rgb(TEXT_MUTED)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .child(account.email.clone()),
+                    )
+                    .when_some(account.plan_name.clone(), |el, plan| {
+                        el.child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x2e3440))
+                                .text_xs()
+                                .text_color(rgb(0x67e8f9))
+                                .child(plan),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("ide-switch-{}", account.id)))
+                            .px(px(10.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .bg(if is_active {
+                                rgb(0x1e3a2f)
+                            } else {
+                                rgb(ACCENT_BLUE)
+                            })
+                            .text_color(if is_active {
+                                rgb(0x86efac)
+                            } else {
+                                rgb(0xffffff)
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !is_active {
+                                    this.switch_antigravity_ide(id_switch.clone(), cx);
+                                }
+                            }))
+                            .child(if is_active { "当前使用" } else { "切换" }),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("ide-del-{}", account.id)))
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .text_xs()
+                            .bg(rgb(0x2d2428))
+                            .text_color(rgb(0xfca5a5))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.delete_antigravity_ide(&id_delete, cx);
+                            }))
+                            .child("移除"),
+                    ),
+            );
+
+        card = card.child(header);
+
+        if let Some(ref usage) = account.usage {
+            let mut bars = div().flex().flex_col().gap(px(8.0));
+            for bucket in &usage.buckets {
+                let reset = bucket
+                    .reset_time
+                    .as_deref()
+                    .map(format_rfc3339_countdown)
+                    .unwrap_or_else(|| "-".to_string());
+                bars = bars.child(Self::render_progress_bar(
+                    &bucket.label,
+                    bucket.remaining_percent,
+                    reset,
+                ));
+            }
+            card = card.child(bars);
+        } else if let Some(ref err) = account.usage_error {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xfca5a5))
+                    .child(err.clone()),
+            );
+        } else {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child("暂无额度快照（打开 Antigravity IDE 后自动采集）"),
+            );
+        }
+
+        card
+    }
 }
 
 impl Render for MainView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_codex = self.platform == Platform::Codex;
+        let is_ag = self.platform == Platform::Antigravity;
+        let is_ide = self.platform == Platform::AntigravityIde;
 
         let titlebar = div()
             .flex()
@@ -893,7 +1144,7 @@ impl Render for MainView {
                     .child(
                         div()
                             .id("tab-codex")
-                            .px(px(14.0))
+                            .px(px(10.0))
                             .py(px(4.0))
                             .rounded(px(6.0))
                             .text_xs()
@@ -918,17 +1169,17 @@ impl Render for MainView {
                     .child(
                         div()
                             .id("tab-antigravity")
-                            .px(px(14.0))
+                            .px(px(10.0))
                             .py(px(4.0))
                             .rounded(px(6.0))
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .bg(if !is_codex {
+                            .bg(if is_ag {
                                 rgb(0x323642)
                             } else {
                                 rgb(BG_WINDOW)
                             })
-                            .text_color(if !is_codex {
+                            .text_color(if is_ag {
                                 rgb(TEXT_PRIMARY)
                             } else {
                                 rgb(TEXT_SECONDARY)
@@ -941,6 +1192,34 @@ impl Render for MainView {
                             .child(format!(
                                 "Antigravity ({})",
                                 self.store.antigravity_accounts.len()
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("tab-antigravity-ide")
+                            .px(px(10.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .bg(if is_ide {
+                                rgb(0x323642)
+                            } else {
+                                rgb(BG_WINDOW)
+                            })
+                            .text_color(if is_ide {
+                                rgb(TEXT_PRIMARY)
+                            } else {
+                                rgb(TEXT_SECONDARY)
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.platform = Platform::AntigravityIde;
+                                cx.notify();
+                            }))
+                            .child(format!(
+                                "IDE ({})",
+                                self.store.antigravity_ide_accounts.len()
                             )),
                     ),
             )
@@ -1038,41 +1317,66 @@ impl Render for MainView {
             .p(px(16.0))
             .overflow_y_scroll();
 
-        if is_codex {
-            if self.store.codex_accounts.is_empty() {
-                list = list.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .py(px(60.0))
-                        .gap(px(8.0))
-                        .text_sm()
-                        .text_color(rgb(TEXT_MUTED))
-                        .child("暂无 Codex 账号，点击右上角「捕获当前」或「导入」"),
-                );
-            } else {
-                for acc in &self.store.codex_accounts {
-                    list = list.child(self.render_codex_card(acc, cx));
+        match self.platform {
+            Platform::Codex => {
+                if self.store.codex_accounts.is_empty() {
+                    list = list.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .py(px(60.0))
+                            .gap(px(8.0))
+                            .text_sm()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child("暂无 Codex 账号，点击右上角「登录授权」「捕获当前」或「导入」"),
+                    );
+                } else {
+                    for acc in &self.store.codex_accounts {
+                        list = list.child(self.render_codex_card(acc, cx));
+                    }
                 }
             }
-        } else if self.store.antigravity_accounts.is_empty() {
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .py(px(60.0))
-                    .gap(px(8.0))
-                    .text_sm()
-                    .text_color(rgb(TEXT_MUTED))
-                    .child("暂无 Antigravity 账号，打开 Antigravity 登录后点击「捕获当前账号」"),
-            );
-        } else {
-            for acc in &self.store.antigravity_accounts {
-                list = list.child(self.render_antigravity_card(acc, cx));
+            Platform::Antigravity => {
+                if self.store.antigravity_accounts.is_empty() {
+                    list = list.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .py(px(60.0))
+                            .gap(px(8.0))
+                            .text_sm()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child("暂无 Antigravity 账号，打开 Antigravity 登录后点击「捕获当前」或「登录授权」"),
+                    );
+                } else {
+                    for acc in &self.store.antigravity_accounts {
+                        list = list.child(self.render_antigravity_card(acc, cx));
+                    }
+                }
+            }
+            Platform::AntigravityIde => {
+                if self.store.antigravity_ide_accounts.is_empty() {
+                    list = list.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .py(px(60.0))
+                            .gap(px(8.0))
+                            .text_sm()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child("暂无 Antigravity IDE 账号，点击「捕获当前」或「登录授权」录入"),
+                    );
+                } else {
+                    for acc in &self.store.antigravity_ide_accounts {
+                        list = list.child(self.render_antigravity_ide_card(acc, cx));
+                    }
+                }
             }
         }
 

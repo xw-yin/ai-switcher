@@ -17,7 +17,9 @@ const CODEX_CLI_RELATIVE_PATHS: [&str; 3] = [
     "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
 ];
 #[cfg(target_os = "macos")]
-const ANTIGRAVITY_APP_NAMES: [&str; 2] = ["Antigravity.app", "Antigravity IDE.app"];
+const ANTIGRAVITY_APP_NAME: &str = "Antigravity.app";
+#[cfg(target_os = "macos")]
+const ANTIGRAVITY_IDE_APP_NAME: &str = "Antigravity IDE.app";
 
 #[cfg(target_os = "macos")]
 fn is_executable_file(path: &Path) -> bool {
@@ -47,15 +49,20 @@ pub fn is_codex_app_bundle(path: &Path) -> bool {
 
 #[cfg(target_os = "macos")]
 pub fn is_antigravity_app_bundle(path: &Path) -> bool {
-    if !path.is_dir() {
-        return false;
-    }
-    let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
-        return false;
-    };
-    ANTIGRAVITY_APP_NAMES
-        .iter()
-        .any(|target| name.eq_ignore_ascii_case(target))
+    path.is_dir()
+        && path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(ANTIGRAVITY_APP_NAME))
+}
+
+#[cfg(target_os = "macos")]
+pub fn is_antigravity_ide_app_bundle(path: &Path) -> bool {
+    path.is_dir()
+        && path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(ANTIGRAVITY_IDE_APP_NAME))
 }
 
 pub fn find_codex_app_path() -> Option<PathBuf> {
@@ -100,17 +107,14 @@ pub fn find_codex_app_path() -> Option<PathBuf> {
 pub fn find_antigravity_app_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let home = dirs::home_dir();
-        for name in ANTIGRAVITY_APP_NAMES {
-            let sys = Path::new("/Applications").join(name);
-            if is_antigravity_app_bundle(&sys) {
-                return Some(sys);
-            }
-            if let Some(ref h) = home {
-                let user = h.join("Applications").join(name);
-                if is_antigravity_app_bundle(&user) {
-                    return Some(user);
-                }
+        let sys = Path::new("/Applications").join(ANTIGRAVITY_APP_NAME);
+        if is_antigravity_app_bundle(&sys) {
+            return Some(sys);
+        }
+        if let Some(h) = dirs::home_dir() {
+            let user = h.join("Applications").join(ANTIGRAVITY_APP_NAME);
+            if is_antigravity_app_bundle(&user) {
+                return Some(user);
             }
         }
         None
@@ -119,19 +123,48 @@ pub fn find_antigravity_app_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let local = dirs::data_local_dir()?;
-        let candidates = [
-            local.join("Programs").join("Antigravity").join("Antigravity.exe"),
-            local
-                .join("Programs")
-                .join("Antigravity IDE")
-                .join("Antigravity IDE.exe"),
-        ];
-        candidates.into_iter().find(|p| p.is_file())
+        let p = local.join("Programs").join("Antigravity").join("Antigravity.exe");
+        p.is_file().then_some(p)
     }
 
     #[cfg(target_os = "linux")]
     {
         ["/usr/bin/antigravity", "/usr/local/bin/antigravity"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+    }
+}
+
+pub fn find_antigravity_ide_app_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let sys = Path::new("/Applications").join(ANTIGRAVITY_IDE_APP_NAME);
+        if is_antigravity_ide_app_bundle(&sys) {
+            return Some(sys);
+        }
+        if let Some(h) = dirs::home_dir() {
+            let user = h.join("Applications").join(ANTIGRAVITY_IDE_APP_NAME);
+            if is_antigravity_ide_app_bundle(&user) {
+                return Some(user);
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let local = dirs::data_local_dir()?;
+        let p = local
+            .join("Programs")
+            .join("Antigravity IDE")
+            .join("Antigravity IDE.exe");
+        p.is_file().then_some(p)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        ["/usr/bin/antigravity-ide", "/usr/local/bin/antigravity-ide"]
             .into_iter()
             .map(PathBuf::from)
             .find(|p| p.is_file())
@@ -287,9 +320,28 @@ pub fn stop_antigravity_desktop() -> Result<(), String> {
                 .and_then(|v| v.to_str())
                 .is_some_and(|name| {
                     let lower = name.to_ascii_lowercase();
-                    lower == "antigravity.exe"
-                        || lower == "antigravity ide.exe"
-                        || lower == "antigravity"
+                    lower == "antigravity.exe" || lower == "antigravity"
+                })
+        })
+    }
+}
+
+pub fn stop_antigravity_ide_desktop() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        stop_matching_processes("Antigravity IDE", |exe| {
+            app_bundle_for_main_executable(exe, is_antigravity_ide_app_bundle).is_some()
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        stop_matching_processes("Antigravity IDE", |exe| {
+            exe.file_name()
+                .and_then(|v| v.to_str())
+                .is_some_and(|name| {
+                    let lower = name.to_ascii_lowercase();
+                    lower == "antigravity ide.exe" || lower == "antigravity-ide"
                 })
         })
     }

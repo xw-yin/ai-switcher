@@ -8,7 +8,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::codex;
-use crate::models::{now_unix_seconds, AccountStore, AntigravityAccount, CodexAccount};
+use crate::models::{
+    now_unix_seconds, AccountStore, AntigravityAccount, AntigravityIdeAccount, CodexAccount,
+};
 
 const APP_DIR_NAME: &str = "com.xwyin.ai-switcher";
 const STORE_FILE_NAME: &str = "accounts.json";
@@ -19,6 +21,8 @@ pub struct ImportSummary {
     pub codex_updated: usize,
     pub antigravity_added: usize,
     pub antigravity_updated: usize,
+    pub ide_added: usize,
+    pub ide_updated: usize,
 }
 
 impl ImportSummary {
@@ -26,16 +30,20 @@ impl ImportSummary {
         let total = self.codex_added
             + self.codex_updated
             + self.antigravity_added
-            + self.antigravity_updated;
+            + self.antigravity_updated
+            + self.ide_added
+            + self.ide_updated;
         if total == 0 {
             return "未发现可导入的账号".to_string();
         }
         format!(
-            "导入完成: Codex +{} / 更新 {}，Antigravity +{} / 更新 {}",
+            "导入完成: Codex +{}/改{}，AG +{}/改{}，IDE +{}/改{}",
             self.codex_added,
             self.codex_updated,
             self.antigravity_added,
-            self.antigravity_updated
+            self.antigravity_updated,
+            self.ide_added,
+            self.ide_updated
         )
     }
 }
@@ -151,6 +159,44 @@ fn upsert_antigravity_account(
     }
 }
 
+fn upsert_antigravity_ide_account(
+    store: &mut AccountStore,
+    incoming: AntigravityIdeAccount,
+    summary: &mut ImportSummary,
+) {
+    if let Some(existing) = store
+        .antigravity_ide_accounts
+        .iter_mut()
+        .find(|a| a.email.eq_ignore_ascii_case(&incoming.email))
+    {
+        existing.oauth_token = incoming.oauth_token;
+        if incoming.user_status.is_some() {
+            existing.user_status = incoming.user_status;
+        }
+        if incoming.model_credits.is_some() {
+            existing.model_credits = incoming.model_credits;
+        }
+        if incoming.profile_url.is_some() {
+            existing.profile_url = incoming.profile_url;
+        }
+        if incoming.plan_name.is_some() {
+            existing.plan_name = incoming.plan_name;
+        }
+        if incoming.usage.is_some() {
+            existing.usage = incoming.usage;
+        }
+        existing.updated_at = now_unix_seconds();
+        summary.ide_updated += 1;
+    } else {
+        store.antigravity_ide_accounts.push(AntigravityIdeAccount {
+            id: Uuid::new_v4().to_string(),
+            updated_at: now_unix_seconds(),
+            ..incoming
+        });
+        summary.ide_added += 1;
+    }
+}
+
 fn normalize_codex_item_to_auth_json(item: &Value) -> Option<Value> {
     if item.get("tokens").is_some() {
         return Some(item.clone());
@@ -254,7 +300,10 @@ pub fn import_accounts_from_value(
     }
 
     // 2. AiSwitcher 原生备份格式
-    if root.get("codex_accounts").is_some() || root.get("antigravity_accounts").is_some() {
+    if root.get("codex_accounts").is_some()
+        || root.get("antigravity_accounts").is_some()
+        || root.get("antigravity_ide_accounts").is_some()
+    {
         if let Some(arr) = root.get("codex_accounts").and_then(Value::as_array) {
             for item in arr {
                 if let Ok(acc) = serde_json::from_value::<CodexAccount>(item.clone()) {
@@ -266,6 +315,13 @@ pub fn import_accounts_from_value(
             for item in arr {
                 if let Ok(acc) = serde_json::from_value::<AntigravityAccount>(item.clone()) {
                     upsert_antigravity_account(store, acc, &mut summary);
+                }
+            }
+        }
+        if let Some(arr) = root.get("antigravity_ide_accounts").and_then(Value::as_array) {
+            for item in arr {
+                if let Ok(acc) = serde_json::from_value::<AntigravityIdeAccount>(item.clone()) {
+                    upsert_antigravity_ide_account(store, acc, &mut summary);
                 }
             }
         }

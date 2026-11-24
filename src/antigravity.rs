@@ -4,13 +4,16 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+use base64::Engine;
 use reqwest::Client;
 use rusqlite::Connection;
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::models::{
-    now_unix_seconds, AccountStore, AntigravityAccount, AntigravityQuotaBucket, AntigravityUsage,
+    now_unix_seconds, AccountStore, AntigravityAccount, AntigravityIdeAccount,
+    AntigravityQuotaBucket, AntigravityUsage,
 };
 use crate::process;
 use crate::store::{save_store, write_private_atomically};
@@ -18,6 +21,9 @@ use crate::store::{save_store, write_private_atomically};
 const KEYCHAIN_SERVICE: &str = "gemini";
 const KEYCHAIN_DEFAULT_ACCOUNT: &str = "antigravity";
 const VSCDB_OAUTH_KEY: &str = "antigravityUnifiedStateSync.oauthToken";
+const VSCDB_USER_STATUS_KEY: &str = "antigravityUnifiedStateSync.userStatus";
+const VSCDB_MODEL_CREDITS_KEY: &str = "antigravityUnifiedStateSync.modelCredits";
+const VSCDB_PROFILE_URL_KEY: &str = "antigravity.profileUrl";
 
 fn antigravity_base_dir() -> Result<PathBuf, String> {
     #[cfg(target_os = "linux")]
@@ -109,7 +115,7 @@ fn write_keychain_secret(service: &str, account: &str, secret: &str) -> Result<(
         .map_err(|e| format!("写入系统凭据库失败: {e}"))
 }
 
-fn read_vscdb_oauth_token() -> Option<String> {
+fn read_vscdb_key(key: &str) -> Option<String> {
     let path = antigravity_ide_vscdb_path().ok()?;
     if !path.is_file() {
         return None;
@@ -117,24 +123,76 @@ fn read_vscdb_oauth_token() -> Option<String> {
     let conn = Connection::open(&path).ok()?;
     conn.query_row(
         "SELECT value FROM ItemTable WHERE key = ?1",
-        [VSCDB_OAUTH_KEY],
+        [key],
         |row| row.get::<_, String>(0),
     )
     .ok()
+    .filter(|v| !v.is_empty())
 }
 
-fn write_vscdb_oauth_token(token_value: &str) -> Result<(), String> {
-    let path = antigravity_ide_vscdb_path()?;
-    if !path.is_file() {
-        return Ok(());
+fn write_vscdb_key(conn: &Connection, key: &str, value: Option<&str>) -> Result<(), String> {
+    match value {
+        Some(val) => {
+            conn.execute(
+                "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
+                [key, val],
+            )
+            .map_err(|e| format!("写入 state.vscdb ({key}) 失败: {e}"))?;
+        }
+        None => {
+            conn.execute("DELETE FROM ItemTable WHERE key = ?1", [key])
+                .map_err(|e| format!("清理 state.vscdb ({key}) 失败: {e}"))?;
+        }
     }
-    let conn = Connection::open(&path).map_err(|e| format!("打开 state.vscdb 失败: {e}"))?;
-    conn.execute(
-        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
-        [VSCDB_OAUTH_KEY, token_value],
-    )
-    .map_err(|e| format!("写入 state.vscdb 失败: {e}"))?;
     Ok(())
+}
+
+fn extract_email_from_bytes(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-' | '@'))) {
+        if let Some((local, domain)) = token.split_once('@') {
+            if !local.is_empty()
+                && domain.contains('.')
+                && domain.len() >= 4
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+            {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn extract_email_from_vscdb_user_status(b64: &str) -> Option<String> {
+    let outer = STANDARD.decode(b64.trim()).ok()?;
+    if let Some(email) = extract_email_from_bytes(&outer) {
+        return Some(email);
+    }
+    let mut start = None;
+    for (i, &b) in outer.iter().enumerate() {
+        let is_b64 = b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-');
+        if is_b64 && start.is_none() {
+            start = Some(i);
+        } else if !is_b64 {
+            if let Some(s) = start.take() {
+                if i - s >= 20 {
+                    if let Ok(seg) = std::str::from_utf8(&outer[s..i]) {
+                        let padded = format!("{seg}{}", "=".repeat((4 - seg.len() % 4) % 4));
+                        if let Ok(inner) = STANDARD
+                            .decode(&padded)
+                            .or_else(|_| URL_SAFE.decode(&padded))
+                        {
+                            if let Some(email) = extract_email_from_bytes(&inner) {
+                                return Some(email);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn read_app_storage_username() -> Option<String> {
@@ -171,7 +229,7 @@ pub struct LiveAntigravityStatus {
 }
 
 #[cfg(unix)]
-fn discover_language_server() -> Result<(String, Vec<u16>), String> {
+fn discover_language_server(for_ide: bool) -> Result<(String, Vec<u16>), String> {
     let ps_out = Command::new("ps")
         .args(["-eo", "pid,args"])
         .output()
@@ -183,6 +241,10 @@ fn discover_language_server() -> Result<(String, Vec<u16>), String> {
 
     for line in ps_text.lines() {
         if !line.contains("language_server") || !line.contains("--csrf_token") {
+            continue;
+        }
+        let is_ide_proc = line.contains("Antigravity IDE") || line.contains("antigravity-ide");
+        if for_ide != is_ide_proc {
             continue;
         }
         let mut parts = line.split_whitespace();
@@ -198,7 +260,11 @@ fn discover_language_server() -> Result<(String, Vec<u16>), String> {
     }
 
     let (Some(pid), Some(csrf)) = (target_pid, csrf_token) else {
-        return Err("未检测到运行中的 Antigravity language_server".to_string());
+        return Err(if for_ide {
+            "未检测到运行中的 Antigravity IDE language_server".to_string()
+        } else {
+            "未检测到运行中的 Antigravity language_server".to_string()
+        });
     };
 
     let lsof_out = Command::new("lsof")
@@ -228,7 +294,7 @@ fn discover_language_server() -> Result<(String, Vec<u16>), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn discover_language_server() -> Result<(String, Vec<u16>), String> {
+fn discover_language_server(for_ide: bool) -> Result<(String, Vec<u16>), String> {
     let system = sysinfo::System::new_all();
     let mut target_pid: Option<u32> = None;
     let mut csrf_token: Option<String> = None;
@@ -239,6 +305,11 @@ fn discover_language_server() -> Result<(String, Vec<u16>), String> {
             continue;
         }
         let cmd = proc.cmd();
+        let joined = cmd.join(" ");
+        let is_ide_proc = joined.contains("Antigravity IDE") || joined.contains("antigravity-ide");
+        if for_ide != is_ide_proc {
+            continue;
+        }
         if let Some(pos) = cmd.iter().position(|t| t == "--csrf_token") {
             if let Some(tok) = cmd.get(pos + 1) {
                 target_pid = Some(pid.as_u32());
@@ -293,8 +364,8 @@ fn classify_model_family(label: &str) -> &'static str {
     }
 }
 
-pub async fn fetch_live_status() -> Result<LiveAntigravityStatus, String> {
-    let (csrf, ports) = discover_language_server()?;
+async fn fetch_live_status_for(for_ide: bool) -> Result<LiveAntigravityStatus, String> {
+    let (csrf, ports) = discover_language_server(for_ide)?;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(5))
@@ -342,6 +413,14 @@ pub async fn fetch_live_status() -> Result<LiveAntigravityStatus, String> {
     }
 
     Err(format!("读取 Antigravity 状态失败: {last_err}"))
+}
+
+pub async fn fetch_live_status() -> Result<LiveAntigravityStatus, String> {
+    fetch_live_status_for(false).await
+}
+
+pub async fn fetch_ide_live_status() -> Result<LiveAntigravityStatus, String> {
+    fetch_live_status_for(true).await
 }
 
 fn parse_user_status_payload(payload: &Value) -> Result<LiveAntigravityStatus, String> {
@@ -433,10 +512,9 @@ pub fn capture_current_account(
     let scoped_secret = scoped_account
         .as_deref()
         .and_then(|acct| read_keychain_secret(KEYCHAIN_SERVICE, acct));
-    let vscdb_oauth_token = read_vscdb_oauth_token();
 
-    if keychain_secret.is_none() && scoped_secret.is_none() && vscdb_oauth_token.is_none() {
-        return Err("未在系统钥匙串或本地存储中找到 Antigravity 凭证".to_string());
+    if keychain_secret.is_none() && scoped_secret.is_none() {
+        return Err("未在系统钥匙串中找到 Antigravity 凭证".to_string());
     }
 
     let plan_name = live.as_ref().and_then(|l| l.plan_name.clone());
@@ -453,9 +531,6 @@ pub fn capture_current_account(
         if scoped_secret.is_some() {
             existing.scoped_keychain_account = scoped_account;
             existing.scoped_keychain_secret = scoped_secret;
-        }
-        if vscdb_oauth_token.is_some() {
-            existing.vscdb_oauth_token = vscdb_oauth_token;
         }
         if plan_name.is_some() {
             existing.plan_name = plan_name;
@@ -477,7 +552,7 @@ pub fn capture_current_account(
         keychain_secret,
         scoped_keychain_account: scoped_account,
         scoped_keychain_secret: scoped_secret,
-        vscdb_oauth_token,
+        vscdb_oauth_token: None,
         usage,
         usage_error: None,
         updated_at: now_unix_seconds(),
@@ -495,7 +570,7 @@ pub fn switch_account(store: &mut AccountStore, target_id: &str) -> Result<Strin
 
     process::stop_antigravity_desktop()?;
 
-    // 切换前先将当前活跃账号的最新 Keychain/vscdb 凭证回写保存
+    // 切换前先将当前活跃账号的最新 Keychain 凭证回写保存
     if let Some(current_email) = read_app_storage_username() {
         if let Some(active) = store
             .antigravity_accounts
@@ -512,9 +587,6 @@ pub fn switch_account(store: &mut AccountStore, target_id: &str) -> Result<Strin
                     active.scoped_keychain_secret = Some(sec);
                 }
             }
-            if let Some(vscdb) = read_vscdb_oauth_token() {
-                active.vscdb_oauth_token = Some(vscdb);
-            }
             active.updated_at = now_unix_seconds();
         }
     }
@@ -529,9 +601,6 @@ pub fn switch_account(store: &mut AccountStore, target_id: &str) -> Result<Strin
     ) {
         write_keychain_secret(KEYCHAIN_SERVICE, acct, sec)?;
     }
-    if let Some(vscdb) = target.vscdb_oauth_token.as_deref() {
-        write_vscdb_oauth_token(vscdb)?;
-    }
     write_app_storage_username(&target.email)?;
 
     let email = target.email.clone();
@@ -543,6 +612,172 @@ pub fn switch_account(store: &mut AccountStore, target_id: &str) -> Result<Strin
     }
 
     Ok(email)
+}
+
+pub fn capture_current_ide_account(
+    store: &mut AccountStore,
+    live: Option<LiveAntigravityStatus>,
+) -> Result<String, String> {
+    let oauth_token = read_vscdb_key(VSCDB_OAUTH_KEY)
+        .ok_or_else(|| "未在 Antigravity IDE state.vscdb 中找到登录凭证".to_string())?;
+    let user_status = read_vscdb_key(VSCDB_USER_STATUS_KEY);
+    let model_credits = read_vscdb_key(VSCDB_MODEL_CREDITS_KEY);
+    let profile_url = read_vscdb_key(VSCDB_PROFILE_URL_KEY);
+
+    let email = live
+        .as_ref()
+        .map(|l| l.email.clone())
+        .or_else(|| {
+            user_status
+                .as_deref()
+                .and_then(extract_email_from_vscdb_user_status)
+        })
+        .ok_or_else(|| "无法从 Antigravity IDE 解析当前登录邮箱".to_string())?;
+
+    let plan_name = live.as_ref().and_then(|l| l.plan_name.clone());
+    let usage = live.map(|l| l.usage);
+
+    if let Some(existing) = store
+        .antigravity_ide_accounts
+        .iter_mut()
+        .find(|a| a.email.eq_ignore_ascii_case(&email))
+    {
+        existing.oauth_token = oauth_token;
+        if user_status.is_some() {
+            existing.user_status = user_status;
+        }
+        if model_credits.is_some() {
+            existing.model_credits = model_credits;
+        }
+        if profile_url.is_some() {
+            existing.profile_url = profile_url;
+        }
+        if plan_name.is_some() {
+            existing.plan_name = plan_name;
+        }
+        if usage.is_some() {
+            existing.usage = usage;
+            existing.usage_error = None;
+        }
+        existing.updated_at = now_unix_seconds();
+        store.active_antigravity_ide_id = Some(existing.id.clone());
+        return Ok(existing.email.clone());
+    }
+
+    let id = Uuid::new_v4().to_string();
+    store.antigravity_ide_accounts.push(AntigravityIdeAccount {
+        id: id.clone(),
+        email: email.clone(),
+        plan_name,
+        oauth_token,
+        user_status,
+        model_credits,
+        profile_url,
+        usage,
+        usage_error: None,
+        updated_at: now_unix_seconds(),
+    });
+    store.active_antigravity_ide_id = Some(id);
+    Ok(email)
+}
+
+pub fn switch_ide_account(store: &mut AccountStore, target_id: &str) -> Result<String, String> {
+    let target_idx = store
+        .antigravity_ide_accounts
+        .iter()
+        .position(|a| a.id == target_id)
+        .ok_or_else(|| "找不到目标 Antigravity IDE 账号".to_string())?;
+
+    process::stop_antigravity_ide_desktop()?;
+
+    // 切换前备份当前活跃 IDE 账号的最新 state.vscdb 状态
+    if let (Some(cur_oauth), Some(cur_status)) = (
+        read_vscdb_key(VSCDB_OAUTH_KEY),
+        read_vscdb_key(VSCDB_USER_STATUS_KEY),
+    ) {
+        if let Some(cur_email) = extract_email_from_vscdb_user_status(&cur_status) {
+            if let Some(active) = store
+                .antigravity_ide_accounts
+                .iter_mut()
+                .find(|a| a.email.eq_ignore_ascii_case(&cur_email))
+            {
+                active.oauth_token = cur_oauth;
+                active.user_status = Some(cur_status);
+                active.model_credits = read_vscdb_key(VSCDB_MODEL_CREDITS_KEY);
+                active.profile_url = read_vscdb_key(VSCDB_PROFILE_URL_KEY);
+                active.updated_at = now_unix_seconds();
+            }
+        }
+    }
+
+    let vscdb_path = antigravity_ide_vscdb_path()?;
+    if !vscdb_path.is_file() {
+        return Err(format!("未找到 Antigravity IDE 数据库: {}", vscdb_path.display()));
+    }
+    let conn = Connection::open(&vscdb_path).map_err(|e| format!("打开 state.vscdb 失败: {e}"))?;
+
+    let target = &store.antigravity_ide_accounts[target_idx];
+    write_vscdb_key(&conn, VSCDB_OAUTH_KEY, Some(&target.oauth_token))?;
+    write_vscdb_key(&conn, VSCDB_USER_STATUS_KEY, target.user_status.as_deref())?;
+    write_vscdb_key(
+        &conn,
+        VSCDB_MODEL_CREDITS_KEY,
+        target.model_credits.as_deref(),
+    )?;
+    write_vscdb_key(&conn, VSCDB_PROFILE_URL_KEY, target.profile_url.as_deref())?;
+    drop(conn);
+
+    let email = target.email.clone();
+    store.active_antigravity_ide_id = Some(target.id.clone());
+    save_store(store)?;
+
+    if let Some(app_path) = process::find_antigravity_ide_app_path() {
+        process::launch_app(&app_path)?;
+    }
+
+    Ok(email)
+}
+
+pub async fn login_new_ide_account_and_save(store: &mut AccountStore) -> Result<String, String> {
+    // 先备份当前活跃 IDE 账号
+    let prev_live = fetch_ide_live_status().await.ok();
+    let _ = capture_current_ide_account(store, prev_live);
+    let _ = save_store(store);
+
+    let app_path = process::find_antigravity_ide_app_path()
+        .ok_or_else(|| "未找到已安装的 Antigravity IDE.app".to_string())?;
+
+    process::stop_antigravity_ide_desktop()?;
+
+    // 清除 state.vscdb 认证键以触发 IDE 重新登录
+    let vscdb_path = antigravity_ide_vscdb_path()?;
+    if vscdb_path.is_file() {
+        let conn = Connection::open(&vscdb_path).map_err(|e| format!("打开 state.vscdb 失败: {e}"))?;
+        write_vscdb_key(&conn, VSCDB_OAUTH_KEY, None)?;
+        write_vscdb_key(&conn, VSCDB_USER_STATUS_KEY, None)?;
+        write_vscdb_key(&conn, VSCDB_MODEL_CREDITS_KEY, None)?;
+        write_vscdb_key(&conn, VSCDB_PROFILE_URL_KEY, None)?;
+    }
+
+    process::launch_app(&app_path)?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err("等待 Antigravity IDE 新账号登录超时（3分钟）".to_string());
+        }
+
+        if read_vscdb_key(VSCDB_OAUTH_KEY).is_some()
+            && read_vscdb_key(VSCDB_USER_STATUS_KEY).is_some()
+        {
+            let live = fetch_ide_live_status().await.ok();
+            if let Ok(email) = capture_current_ide_account(store, live) {
+                save_store(store)?;
+                return Ok(email);
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

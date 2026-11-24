@@ -5,6 +5,7 @@ use serde_json::Value;
 pub enum Platform {
     Codex,
     Antigravity,
+    AntigravityIde,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,7 +73,22 @@ pub struct AntigravityAccount {
     pub keychain_secret: Option<String>,
     pub scoped_keychain_account: Option<String>,
     pub scoped_keychain_secret: Option<String>,
+    #[serde(default)]
     pub vscdb_oauth_token: Option<String>,
+    pub usage: Option<AntigravityUsage>,
+    pub usage_error: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AntigravityIdeAccount {
+    pub id: String,
+    pub email: String,
+    pub plan_name: Option<String>,
+    pub oauth_token: String,
+    pub user_status: Option<String>,
+    pub model_credits: Option<String>,
+    pub profile_url: Option<String>,
     pub usage: Option<AntigravityUsage>,
     pub usage_error: Option<String>,
     pub updated_at: i64,
@@ -80,10 +96,18 @@ pub struct AntigravityAccount {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AccountStore {
+    #[serde(default)]
     pub codex_accounts: Vec<CodexAccount>,
+    #[serde(default)]
     pub active_codex_id: Option<String>,
+    #[serde(default)]
     pub antigravity_accounts: Vec<AntigravityAccount>,
+    #[serde(default)]
     pub active_antigravity_id: Option<String>,
+    #[serde(default)]
+    pub antigravity_ide_accounts: Vec<AntigravityIdeAccount>,
+    #[serde(default)]
+    pub active_antigravity_ide_id: Option<String>,
 }
 
 pub fn now_unix_seconds() -> i64 {
