@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag (e.g. v0.1.0)"
+        description: "Release tag (e.g. v0.1.1)"
         required: true
         type: string
       channel:
@@ -27,15 +27,27 @@ permissions:
 
 jobs:
   test:
-    name: Check & Test (macOS)
-    runs-on: macos-latest
+    name: Check & Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libfontconfig1-dev libssl-dev libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
       - run: cargo test --locked
 
-  package:
+  package-macos:
     name: Package macOS (${{ matrix.arch_label }})
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     needs: test
@@ -58,29 +70,87 @@ jobs:
         run: |
           chmod +x scripts/bundle-macos.sh
           ./scripts/bundle-macos.sh --target "${{ matrix.target }}" --arch-label "${{ matrix.arch_label }}" --package
+          mkdir -p upload
+          cp target/dist/*.dmg upload/
+          cp target/dist/*.zip upload/
+          cp target/${{ matrix.target }}/release/ai-switcher upload/ai-switcher
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch_label }}
-          path: |
-            target/dist/*.dmg
-            target/dist/*.zip
-            target/${{ matrix.target }}/release/ai-switcher
+          path: upload/*
+
+  package-windows:
+    name: Package Windows (x86_64)
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - name: Build Windows release zip
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force -Path upload/staging | Out-Null
+          Copy-Item target/release/ai-switcher.exe upload/staging/AI-Switcher.exe
+          Copy-Item README.md upload/staging/README.md
+          Compress-Archive -Path upload/staging/* -DestinationPath "upload/AI-Switcher-v${version}-windows-x86_64.zip" -Force
+          Remove-Item -Recurse -Force upload/staging
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: upload/*.zip
+
+  package-linux:
+    name: Package Linux (x86_64)
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libfontconfig1-dev libssl-dev libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - name: Build Linux release tar.gz
+        run: |
+          cargo build --release --locked
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          mkdir -p upload/ai-switcher
+          cp target/release/ai-switcher upload/ai-switcher/ai-switcher
+          cp assets/app-icon.png upload/ai-switcher/ai-switcher.png
+          cp README.md upload/ai-switcher/README.md
+          tar -czf "upload/AI-Switcher-v${VERSION}-linux-x86_64.tar.gz" -C upload ai-switcher
+          rm -rf upload/ai-switcher
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: upload/*.tar.gz
 
   release:
-    name: Build Universal & Publish Release
+    name: Assemble Universal & Publish Release
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    needs: package
+    needs: [package-macos, package-windows, package-linux]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download build artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Assemble Universal binary, DMG, ZIP, Checksums & Homebrew Cask
+      - name: Assemble Universal macOS, Checksums & Homebrew Cask
         shell: bash
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
@@ -93,6 +163,8 @@ jobs:
           cp artifacts/macos-arm64/*.zip release-assets/
           cp artifacts/macos-x86_64/*.dmg release-assets/
           cp artifacts/macos-x86_64/*.zip release-assets/
+          cp artifacts/windows-x86_64/*.zip release-assets/
+          cp artifacts/linux-x86_64/*.tar.gz release-assets/
 
           # 合并生成 macOS Universal 通用包 (Apple Silicon + Intel)
           UNIVERSAL_APP="release-assets/AI Switcher.app"
@@ -145,10 +217,10 @@ jobs:
           hdiutil create -volname "AI Switcher" -srcfolder dmg-staging -ov -format UDZO "release-assets/$UNI_DMG" >/dev/null
           rm -rf dmg-staging "$UNIVERSAL_APP"
 
-          # 生成 SHA256 校验文件
-          (cd release-assets && shasum -a 256 *.dmg *.zip > SHA256SUMS.txt)
+          # 生成全平台 SHA256 校验文件
+          (cd release-assets && shasum -a 256 *.dmg *.zip *.tar.gz > SHA256SUMS.txt)
 
-          # 生成 Homebrew Cask 清单文件（可直接用于 tap 或本地 brew install --cask）
+          # 生成 Homebrew Cask 清单文件
           UNI_SHA=$(shasum -a 256 "release-assets/$UNI_DMG" | awk '{print $1}')
           cat > release-assets/ai-switcher.rb << EOF
           cask "ai-switcher" do
@@ -157,7 +229,7 @@ jobs:
 
             url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${UNI_DMG}"
             name "AI Switcher"
-            desc "Lightweight macOS account switcher and quota monitor for Codex & Antigravity built with GPUI"
+            desc "Lightweight cross-platform account switcher and quota monitor for Codex & Antigravity built with GPUI"
             homepage "https://github.com/${GITHUB_REPOSITORY}"
 
             app "AI Switcher.app"
@@ -174,5 +246,6 @@ jobs:
           files: |
             release-assets/*.dmg
             release-assets/*.zip
+            release-assets/*.tar.gz
             release-assets/SHA256SUMS.txt
             release-assets/ai-switcher.rb

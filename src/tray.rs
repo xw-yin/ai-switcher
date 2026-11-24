@@ -1,4 +1,6 @@
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use muda::{Menu, MenuEvent, MenuItem};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::models::AccountStore;
@@ -10,6 +12,7 @@ pub enum TrayAction {
     Quit,
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub struct TrayController {
     tray: TrayIcon,
     show_id: muda::MenuId,
@@ -17,6 +20,10 @@ pub struct TrayController {
     quit_id: muda::MenuId,
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub struct TrayController;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl TrayController {
     pub fn new() -> Result<Self, String> {
         let menu = Menu::new();
@@ -34,13 +41,16 @@ impl TrayController {
 
         let icon = build_template_icon()?;
 
-        let tray = TrayIconBuilder::new()
+        let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
             .with_icon(icon)
-            .with_icon_as_template(true)
-            .with_title(" AI")
-            .with_tooltip("AI Switcher — 左键打开窗口 / 右键菜单")
+            .with_tooltip("AI Switcher — 左键打开窗口 / 右键菜单");
+
+        #[cfg(target_os = "macos")]
+        let builder = builder.with_icon_as_template(true).with_title(" AI");
+
+        let tray = builder
             .build()
             .map_err(|e| format!("创建菜单栏托盘失败: {e}"))?;
 
@@ -53,7 +63,11 @@ impl TrayController {
     }
 
     pub fn set_title(&self, title: &str) {
+        #[cfg(target_os = "macos")]
         self.tray.set_title(Some(title));
+        let _ = self
+            .tray
+            .set_tooltip(Some(format!("AI Switcher — {}", title.trim())));
     }
 
     pub fn update_from_store(&self, store: &AccountStore) {
@@ -88,6 +102,20 @@ impl TrayController {
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+impl TrayController {
+    pub fn new() -> Result<Self, String> {
+        Err("Linux 暂不启用系统托盘".to_string())
+    }
+
+    pub fn update_from_store(&self, _store: &AccountStore) {}
+
+    pub fn poll_actions(&self) -> Vec<TrayAction> {
+        Vec::new()
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn format_tray_title(store: &AccountStore) -> String {
     let cx_part = store
         .active_codex_id
@@ -127,6 +155,7 @@ pub fn format_tray_title(store: &AccountStore) -> String {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn dist_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let abx = bx - ax;
     let aby = by - ay;
@@ -144,18 +173,17 @@ fn dist_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 
 }
 
 /// 36x36 Retina 极简模板图标：双向切换箭头（⇄），与 App 图标一致
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn build_template_icon() -> Result<Icon, String> {
     let size = 36u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     let half_w = 1.65f32;
+    let fg: u8 = if cfg!(target_os = "macos") { 0 } else { 245 };
 
-    // 6 条线段组成极简圆头双向箭头（上右、下左）
     let segments: [(f32, f32, f32, f32); 6] = [
-        // 上箭头（向右）
         (7.5, 12.0, 28.5, 12.0),
         (22.5, 6.5, 28.5, 12.0),
         (22.5, 17.5, 28.5, 12.0),
-        // 下箭头（向左）
         (28.5, 24.0, 7.5, 24.0),
         (13.5, 18.5, 7.5, 24.0),
         (13.5, 29.5, 7.5, 24.0),
@@ -178,9 +206,9 @@ fn build_template_icon() -> Result<Icon, String> {
             }
             let alpha = ((coverage / 16.0) * 255.0).round() as u8;
             let idx = ((y * size + x) * 4) as usize;
-            rgba[idx] = 0;
-            rgba[idx + 1] = 0;
-            rgba[idx + 2] = 0;
+            rgba[idx] = fg;
+            rgba[idx + 1] = fg;
+            rgba[idx + 2] = fg;
             rgba[idx + 3] = alpha;
         }
     }

@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -78,6 +79,7 @@ pub fn write_private_atomically(path: &Path, content: &[u8]) -> Result<(), Strin
             .map_err(|e| format!("写入文件失败: {e}"))?;
         file.sync_all().map_err(|e| format!("刷盘失败: {e}"))?;
     }
+    #[cfg(unix)]
     let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
     fs::rename(&tmp_path, path).map_err(|e| format!("替换文件失败: {e}"))?;
     Ok(())

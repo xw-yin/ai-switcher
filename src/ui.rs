@@ -876,7 +876,7 @@ impl Render for MainView {
             .items_center()
             .justify_between()
             .h(px(48.0))
-            .pl(px(82.0))
+            .pl(px(if cfg!(target_os = "macos") { 82.0 } else { 16.0 }))
             .pr(px(16.0))
             .bg(rgb(BG_SURFACE))
             .border_b_1()

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -7,21 +8,25 @@ use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, System, Uid};
 
+#[cfg(target_os = "macos")]
 const CODEX_APP_NAMES: [&str; 3] = ["ChatGPT.app", "Codex.app", "Codex Desktop.app"];
+#[cfg(target_os = "macos")]
 const CODEX_CLI_RELATIVE_PATHS: [&str; 3] = [
     "Contents/Resources/codex",
     "Contents/Resources/codex-cli/bin/codex",
     "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
 ];
-
+#[cfg(target_os = "macos")]
 const ANTIGRAVITY_APP_NAMES: [&str; 2] = ["Antigravity.app", "Antigravity IDE.app"];
 
+#[cfg(target_os = "macos")]
 fn is_executable_file(path: &Path) -> bool {
     path.metadata()
         .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "macos")]
 pub fn is_codex_app_bundle(path: &Path) -> bool {
     if !path.is_dir() {
         return false;
@@ -40,6 +45,7 @@ pub fn is_codex_app_bundle(path: &Path) -> bool {
         .any(|rel| is_executable_file(&path.join(rel)))
 }
 
+#[cfg(target_os = "macos")]
 pub fn is_antigravity_app_bundle(path: &Path) -> bool {
     if !path.is_dir() {
         return false;
@@ -53,39 +59,86 @@ pub fn is_antigravity_app_bundle(path: &Path) -> bool {
 }
 
 pub fn find_codex_app_path() -> Option<PathBuf> {
-    let home = dirs::home_dir();
-    for name in CODEX_APP_NAMES {
-        let sys = Path::new("/Applications").join(name);
-        if is_codex_app_bundle(&sys) {
-            return Some(sys);
-        }
-        if let Some(ref h) = home {
-            let user = h.join("Applications").join(name);
-            if is_codex_app_bundle(&user) {
-                return Some(user);
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir();
+        for name in CODEX_APP_NAMES {
+            let sys = Path::new("/Applications").join(name);
+            if is_codex_app_bundle(&sys) {
+                return Some(sys);
+            }
+            if let Some(ref h) = home {
+                let user = h.join("Applications").join(name);
+                if is_codex_app_bundle(&user) {
+                    return Some(user);
+                }
             }
         }
+        None
     }
-    None
+
+    #[cfg(target_os = "windows")]
+    {
+        let local = dirs::data_local_dir()?;
+        let candidates = [
+            local.join("Programs").join("OpenAI").join("Codex").join("Codex.exe"),
+            local.join("Programs").join("ChatGPT").join("ChatGPT.exe"),
+            local.join("OpenAI").join("Codex").join("Codex.exe"),
+        ];
+        candidates.into_iter().find(|p| p.is_file())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        ["/usr/bin/codex", "/usr/local/bin/codex"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+    }
 }
 
 pub fn find_antigravity_app_path() -> Option<PathBuf> {
-    let home = dirs::home_dir();
-    for name in ANTIGRAVITY_APP_NAMES {
-        let sys = Path::new("/Applications").join(name);
-        if is_antigravity_app_bundle(&sys) {
-            return Some(sys);
-        }
-        if let Some(ref h) = home {
-            let user = h.join("Applications").join(name);
-            if is_antigravity_app_bundle(&user) {
-                return Some(user);
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir();
+        for name in ANTIGRAVITY_APP_NAMES {
+            let sys = Path::new("/Applications").join(name);
+            if is_antigravity_app_bundle(&sys) {
+                return Some(sys);
+            }
+            if let Some(ref h) = home {
+                let user = h.join("Applications").join(name);
+                if is_antigravity_app_bundle(&user) {
+                    return Some(user);
+                }
             }
         }
+        None
     }
-    None
+
+    #[cfg(target_os = "windows")]
+    {
+        let local = dirs::data_local_dir()?;
+        let candidates = [
+            local.join("Programs").join("Antigravity").join("Antigravity.exe"),
+            local
+                .join("Programs")
+                .join("Antigravity IDE")
+                .join("Antigravity IDE.exe"),
+        ];
+        candidates.into_iter().find(|p| p.is_file())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        ["/usr/bin/antigravity", "/usr/local/bin/antigravity"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+    }
 }
 
+#[cfg(target_os = "macos")]
 fn app_bundle_for_main_executable<'a>(
     executable: &'a Path,
     matcher: impl Fn(&Path) -> bool,
@@ -130,24 +183,21 @@ fn collect_descendants(
     }
 }
 
-fn running_app_process_ids(
+fn running_matching_process_ids(
     system: &System,
-    user_id: &Uid,
-    matcher: impl Fn(&Path) -> bool,
+    user_id: Option<&Uid>,
+    is_target_exe: impl Fn(&Path) -> bool,
 ) -> HashSet<Pid> {
     let same_user: Vec<(Pid, &sysinfo::Process)> = system
         .processes()
         .iter()
-        .filter(|(_, p)| p.user_id() == Some(user_id))
+        .filter(|(_, p)| user_id.is_none() || p.user_id() == user_id)
         .map(|(pid, p)| (*pid, p))
         .collect();
 
     let roots: HashSet<Pid> = same_user
         .iter()
-        .filter_map(|(pid, proc)| {
-            proc.exe()
-                .and_then(|exe| app_bundle_for_main_executable(exe, &matcher).map(|_| *pid))
-        })
+        .filter_map(|(pid, proc)| proc.exe().and_then(|exe| is_target_exe(exe).then_some(*pid)))
         .collect();
 
     let parents: Vec<(Pid, Option<Pid>)> = same_user
@@ -158,16 +208,16 @@ fn running_app_process_ids(
     collect_descendants(roots, &parents)
 }
 
-fn stop_app_processes(label: &str, matcher: impl Fn(&Path) -> bool) -> Result<(), String> {
+fn stop_matching_processes(label: &str, is_target_exe: impl Fn(&Path) -> bool) -> Result<(), String> {
     let mut system = System::new_all();
     let current_pid = sysinfo::get_current_pid().map_err(|e| e.to_string())?;
     let user_id = system
         .process(current_pid)
         .and_then(|p| p.user_id())
-        .cloned()
-        .ok_or_else(|| format!("无法识别当前用户，未结束 {label}"))?;
+        .cloned();
 
-    let mut remaining = running_app_process_ids(&system, &user_id, &matcher);
+    let mut remaining = running_matching_process_ids(&system, user_id.as_ref(), &is_target_exe);
+    remaining.remove(&current_pid);
     if remaining.is_empty() {
         return Ok(());
     }
@@ -182,7 +232,12 @@ fn stop_app_processes(label: &str, matcher: impl Fn(&Path) -> bool) -> Result<()
         thread::sleep(Duration::from_millis(60));
         system.refresh_processes();
         remaining.retain(|pid| system.process(*pid).is_some());
-        remaining.extend(running_app_process_ids(&system, &user_id, &matcher));
+        remaining.extend(running_matching_process_ids(
+            &system,
+            user_id.as_ref(),
+            &is_target_exe,
+        ));
+        remaining.remove(&current_pid);
         if remaining.is_empty() {
             thread::sleep(Duration::from_millis(200));
             return Ok(());
@@ -194,21 +249,100 @@ fn stop_app_processes(label: &str, matcher: impl Fn(&Path) -> bool) -> Result<()
 }
 
 pub fn stop_codex_desktop() -> Result<(), String> {
-    stop_app_processes("ChatGPT/Codex", is_codex_app_bundle)
+    #[cfg(target_os = "macos")]
+    {
+        stop_matching_processes("ChatGPT/Codex", |exe| {
+            app_bundle_for_main_executable(exe, is_codex_app_bundle).is_some()
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        stop_matching_processes("ChatGPT/Codex", |exe| {
+            exe.file_name()
+                .and_then(|v| v.to_str())
+                .is_some_and(|name| {
+                    let lower = name.to_ascii_lowercase();
+                    lower == "codex.exe"
+                        || lower == "chatgpt.exe"
+                        || lower == "codex"
+                        || lower == "codex-desktop"
+                })
+        })
+    }
 }
 
 pub fn stop_antigravity_desktop() -> Result<(), String> {
-    stop_app_processes("Antigravity", is_antigravity_app_bundle)
+    #[cfg(target_os = "macos")]
+    {
+        stop_matching_processes("Antigravity", |exe| {
+            app_bundle_for_main_executable(exe, is_antigravity_app_bundle).is_some()
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        stop_matching_processes("Antigravity", |exe| {
+            exe.file_name()
+                .and_then(|v| v.to_str())
+                .is_some_and(|name| {
+                    let lower = name.to_ascii_lowercase();
+                    lower == "antigravity.exe"
+                        || lower == "antigravity ide.exe"
+                        || lower == "antigravity"
+                })
+        })
+    }
 }
 
 pub fn launch_app(path: &Path) -> Result<(), String> {
-    let status = Command::new("open")
-        .arg("-na")
-        .arg(path)
-        .status()
-        .map_err(|e| format!("启动 {} 失败: {e}", path.display()))?;
-    if !status.success() {
-        return Err(format!("启动 {} 返回非零状态", path.display()));
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("open")
+            .arg("-na")
+            .arg(path)
+            .status()
+            .map_err(|e| format!("启动 {} 失败: {e}", path.display()))?;
+        if !status.success() {
+            return Err(format!("启动 {} 返回非零状态", path.display()));
+        }
+        Ok(())
     }
-    Ok(())
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Command::new(path)
+            .spawn()
+            .map_err(|e| format!("启动 {} 失败: {e}", path.display()))?;
+        Ok(())
+    }
+}
+
+pub fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(url)
+            .status()
+            .map_err(|e| format!("打开浏览器失败: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .map_err(|e| format!("打开浏览器失败: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("打开浏览器失败: {e}"))?;
+        Ok(())
+    }
 }

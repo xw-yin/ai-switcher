@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -402,10 +401,7 @@ pub async fn oauth_login_and_save(store: &mut AccountStore) -> Result<String, St
         .append_pair("codex_cli_simplified_flow", "true")
         .append_pair("originator", OAUTH_ORIGINATOR);
 
-    Command::new("open")
-        .arg(auth_url.as_str())
-        .status()
-        .map_err(|e| format!("打开浏览器失败: {e}"))?;
+    process::open_url(auth_url.as_str())?;
 
     let code = wait_for_oauth_callback(listener, &state).await?;
     let auth_json = exchange_code_for_auth(&code, &redirect_uri, &code_verifier).await?;

@@ -19,14 +19,20 @@ const KEYCHAIN_SERVICE: &str = "gemini";
 const KEYCHAIN_DEFAULT_ACCOUNT: &str = "antigravity";
 const VSCDB_OAUTH_KEY: &str = "antigravityUnifiedStateSync.oauthToken";
 
+fn antigravity_base_dir() -> Result<PathBuf, String> {
+    #[cfg(target_os = "linux")]
+    let dir = dirs::config_dir();
+    #[cfg(not(target_os = "linux"))]
+    let dir = dirs::data_dir();
+    dir.ok_or_else(|| "无法读取应用数据目录".to_string())
+}
+
 fn antigravity_support_dir() -> Result<PathBuf, String> {
-    let data_dir = dirs::data_dir().ok_or_else(|| "无法读取 Application Support 目录".to_string())?;
-    Ok(data_dir.join("Antigravity"))
+    Ok(antigravity_base_dir()?.join("Antigravity"))
 }
 
 fn antigravity_ide_vscdb_path() -> Result<PathBuf, String> {
-    let data_dir = dirs::data_dir().ok_or_else(|| "无法读取 Application Support 目录".to_string())?;
-    Ok(data_dir
+    Ok(antigravity_base_dir()?
         .join("Antigravity IDE")
         .join("User")
         .join("globalStorage")
@@ -44,6 +50,7 @@ fn read_credential_user_scope() -> Option<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn read_keychain_secret(service: &str, account: &str) -> Option<String> {
     let out = Command::new("/usr/bin/security")
         .args(["find-generic-password", "-s", service, "-a", account, "-w"])
@@ -60,6 +67,18 @@ fn read_keychain_secret(service: &str, account: &str) -> Option<String> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn read_keychain_secret(service: &str, account: &str) -> Option<String> {
+    let entry = keyring::Entry::new(service, account).ok()?;
+    let secret = entry.get_password().ok()?;
+    if secret.trim().is_empty() {
+        None
+    } else {
+        Some(secret)
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn write_keychain_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {
     let out = Command::new("/usr/bin/security")
         .args([
@@ -79,6 +98,15 @@ fn write_keychain_secret(service: &str, account: &str, secret: &str) -> Result<(
         return Err(format!("写入 Keychain 返回错误: {}", stderr.trim()));
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_keychain_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {
+    let entry =
+        keyring::Entry::new(service, account).map_err(|e| format!("初始化系统凭据库失败: {e}"))?;
+    entry
+        .set_password(secret)
+        .map_err(|e| format!("写入系统凭据库失败: {e}"))
 }
 
 fn read_vscdb_oauth_token() -> Option<String> {
@@ -142,6 +170,7 @@ pub struct LiveAntigravityStatus {
     pub usage: AntigravityUsage,
 }
 
+#[cfg(unix)]
 fn discover_language_server() -> Result<(String, Vec<u16>), String> {
     let ps_out = Command::new("ps")
         .args(["-eo", "pid,args"])
@@ -153,7 +182,7 @@ fn discover_language_server() -> Result<(String, Vec<u16>), String> {
     let mut csrf_token: Option<String> = None;
 
     for line in ps_text.lines() {
-        if !line.contains("/bin/language_server") || !line.contains("--csrf_token") {
+        if !line.contains("language_server") || !line.contains("--csrf_token") {
             continue;
         }
         let mut parts = line.split_whitespace();
@@ -186,6 +215,59 @@ fn discover_language_server() -> Result<(String, Vec<u16>), String> {
             if let Ok(port) = port_str.parse::<u16>() {
                 if !ports.contains(&port) {
                     ports.push(port);
+                }
+            }
+        }
+    }
+
+    if ports.is_empty() {
+        return Err("未找到 Antigravity language_server 监听端口".to_string());
+    }
+
+    Ok((csrf, ports))
+}
+
+#[cfg(target_os = "windows")]
+fn discover_language_server() -> Result<(String, Vec<u16>), String> {
+    let system = sysinfo::System::new_all();
+    let mut target_pid: Option<u32> = None;
+    let mut csrf_token: Option<String> = None;
+
+    for (pid, proc) in system.processes() {
+        let name = proc.name().to_ascii_lowercase();
+        if !name.contains("language_server") {
+            continue;
+        }
+        let cmd = proc.cmd();
+        if let Some(pos) = cmd.iter().position(|t| t == "--csrf_token") {
+            if let Some(tok) = cmd.get(pos + 1) {
+                target_pid = Some(pid.as_u32());
+                csrf_token = Some(tok.clone());
+                break;
+            }
+        }
+    }
+
+    let (Some(pid), Some(csrf)) = (target_pid, csrf_token) else {
+        return Err("未检测到运行中的 Antigravity language_server".to_string());
+    };
+
+    let netstat_out = Command::new("netstat")
+        .args(["-ano", "-p", "TCP"])
+        .output()
+        .map_err(|e| format!("执行 netstat 失败: {e}"))?;
+    let text = String::from_utf8_lossy(&netstat_out.stdout);
+    let pid_str = pid.to_string();
+
+    let mut ports = Vec::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 5 && cols[3].eq_ignore_ascii_case("LISTENING") && cols[4] == pid_str {
+            if let Some(rest) = cols[1].strip_prefix("127.0.0.1:") {
+                if let Ok(port) = rest.parse::<u16>() {
+                    if !ports.contains(&port) {
+                        ports.push(port);
+                    }
                 }
             }
         }
@@ -463,10 +545,18 @@ pub fn switch_account(store: &mut AccountStore, target_id: &str) -> Result<Strin
     Ok(email)
 }
 
+#[cfg(target_os = "macos")]
 fn delete_keychain_secret(service: &str, account: &str) {
     let _ = Command::new("/usr/bin/security")
         .args(["delete-generic-password", "-s", service, "-a", account])
         .output();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn delete_keychain_secret(service: &str, account: &str) {
+    if let Ok(entry) = keyring::Entry::new(service, account) {
+        let _ = entry.delete_credential();
+    }
 }
 
 pub async fn login_new_account_and_save(store: &mut AccountStore) -> Result<String, String> {
