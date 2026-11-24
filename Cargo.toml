@@ -1,0 +1,21 @@
+[package]
+name = "ai-switcher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
+reqwest = { version = "0.12", features = ["json", "gzip", "rustls-tls"] }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock"] }
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+sysinfo = "0.30"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tray-icon = "0.21"
+muda = "0.17"
+png = "0.17"

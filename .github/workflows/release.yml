@@ -1,0 +1,178 @@
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        type: string
+      channel:
+        description: "Release channel"
+        required: true
+        default: "stable"
+        type: choice
+        options:
+          - stable
+          - beta
+          - nightly
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Check & Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  package:
+    name: Package macOS (${{ matrix.arch_label }})
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch_label: arm64
+          - target: x86_64-apple-darwin
+            arch_label: x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+      - name: Build .app, .dmg and .zip
+        run: |
+          chmod +x scripts/bundle-macos.sh
+          ./scripts/bundle-macos.sh --target "${{ matrix.target }}" --arch-label "${{ matrix.arch_label }}" --package
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch_label }}
+          path: |
+            target/dist/*.dmg
+            target/dist/*.zip
+            target/${{ matrix.target }}/release/ai-switcher
+
+  release:
+    name: Build Universal & Publish Release
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: package
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble Universal binary, DMG, ZIP, Checksums & Homebrew Cask
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          mkdir -p release-assets
+
+          cp artifacts/macos-arm64/*.dmg release-assets/
+          cp artifacts/macos-arm64/*.zip release-assets/
+          cp artifacts/macos-x86_64/*.dmg release-assets/
+          cp artifacts/macos-x86_64/*.zip release-assets/
+
+          # 合并生成 macOS Universal 通用包 (Apple Silicon + Intel)
+          UNIVERSAL_APP="release-assets/AI Switcher.app"
+          mkdir -p "$UNIVERSAL_APP/Contents/MacOS" "$UNIVERSAL_APP/Contents/Resources"
+          lipo -create \
+            artifacts/macos-arm64/ai-switcher \
+            artifacts/macos-x86_64/ai-switcher \
+            -output "$UNIVERSAL_APP/Contents/MacOS/ai-switcher"
+          chmod +x "$UNIVERSAL_APP/Contents/MacOS/ai-switcher"
+          cp assets/AppIcon.icns "$UNIVERSAL_APP/Contents/Resources/AppIcon.icns"
+
+          cat > "$UNIVERSAL_APP/Contents/Info.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>AI Switcher</string>
+              <key>CFBundleDisplayName</key>
+              <string>AI Switcher</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.xwyin.ai-switcher</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleExecutable</key>
+              <string>ai-switcher</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>13.0</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+          codesign --force --deep --sign - "$UNIVERSAL_APP" >/dev/null 2>&1 || true
+
+          UNI_ZIP="AI-Switcher-v${VERSION}-macos-universal.zip"
+          UNI_DMG="AI-Switcher-v${VERSION}-macos-universal.dmg"
+          ditto -c -k --sequesterRsrc --keepParent "$UNIVERSAL_APP" "release-assets/$UNI_ZIP"
+
+          mkdir -p dmg-staging
+          cp -R "$UNIVERSAL_APP" dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create -volname "AI Switcher" -srcfolder dmg-staging -ov -format UDZO "release-assets/$UNI_DMG" >/dev/null
+          rm -rf dmg-staging "$UNIVERSAL_APP"
+
+          # 生成 SHA256 校验文件
+          (cd release-assets && shasum -a 256 *.dmg *.zip > SHA256SUMS.txt)
+
+          # 生成 Homebrew Cask 清单文件（可直接用于 tap 或本地 brew install --cask）
+          UNI_SHA=$(shasum -a 256 "release-assets/$UNI_DMG" | awk '{print $1}')
+          cat > release-assets/ai-switcher.rb << EOF
+          cask "ai-switcher" do
+            version "${VERSION}"
+            sha256 "${UNI_SHA}"
+
+            url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${UNI_DMG}"
+            name "AI Switcher"
+            desc "Lightweight macOS account switcher and quota monitor for Codex & Antigravity built with GPUI"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+
+            app "AI Switcher.app"
+          end
+          EOF
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          name: "AI Switcher ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}"
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.channel != 'stable' || contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            release-assets/*.dmg
+            release-assets/*.zip
+            release-assets/SHA256SUMS.txt
+            release-assets/ai-switcher.rb
