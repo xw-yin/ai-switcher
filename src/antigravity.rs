@@ -323,8 +323,11 @@ fn discover_language_server(for_ide: bool) -> Result<(String, Vec<u16>), String>
         return Err("未检测到运行中的 Antigravity language_server".to_string());
     };
 
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let netstat_out = Command::new("netstat")
         .args(["-ano", "-p", "TCP"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("执行 netstat 失败: {e}"))?;
     let text = String::from_utf8_lossy(&netstat_out.stdout);
