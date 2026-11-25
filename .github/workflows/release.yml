@@ -89,7 +89,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
-      - name: Build Windows release zip
+      - name: Build Windows portable zip and NSIS installer
         shell: pwsh
         run: |
           cargo build --release --locked
@@ -99,11 +99,14 @@ jobs:
           Copy-Item README.md upload/staging/README.md
           Compress-Archive -Path upload/staging/* -DestinationPath "upload/AI-Switcher-v${version}-windows-x86_64.zip" -Force
           Remove-Item -Recurse -Force upload/staging
-      - name: Upload Windows artifact
+          makensis "/DAPP_VERSION=${version}" scripts/installer.nsi
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64
-          path: upload/*.zip
+          path: |
+            upload/*.zip
+            upload/*.exe
 
   package-linux:
     name: Package Linux (x86_64)
@@ -164,6 +167,7 @@ jobs:
           cp artifacts/macos-x86_64/*.dmg release-assets/
           cp artifacts/macos-x86_64/*.zip release-assets/
           cp artifacts/windows-x86_64/*.zip release-assets/
+          cp artifacts/windows-x86_64/*.exe release-assets/
           cp artifacts/linux-x86_64/*.tar.gz release-assets/
 
           # 合并生成 macOS Universal 通用包 (Apple Silicon + Intel)
@@ -218,7 +222,7 @@ jobs:
           rm -rf dmg-staging "$UNIVERSAL_APP"
 
           # 生成全平台 SHA256 校验文件
-          (cd release-assets && shasum -a 256 *.dmg *.zip *.tar.gz > SHA256SUMS.txt)
+          (cd release-assets && shasum -a 256 *.dmg *.zip *.exe *.tar.gz > SHA256SUMS.txt)
 
           # 生成 Homebrew Cask 清单文件
           UNI_SHA=$(shasum -a 256 "release-assets/$UNI_DMG" | awk '{print $1}')
@@ -246,6 +250,7 @@ jobs:
           files: |
             release-assets/*.dmg
             release-assets/*.zip
+            release-assets/*.exe
             release-assets/*.tar.gz
             release-assets/SHA256SUMS.txt
             release-assets/ai-switcher.rb

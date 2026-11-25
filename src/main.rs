@@ -31,11 +31,31 @@ mod win32_window {
     const SW_HIDE: i32 = 0;
     const SW_SHOW: i32 = 5;
     const SW_RESTORE: i32 = 9;
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_SMALL: usize = 0;
+    const ICON_BIG: usize = 1;
+    const IMAGE_ICON: u32 = 1;
+    const LR_DEFAULTSIZE: u32 = 0x0000_0040;
+    const LR_SHARED: u32 = 0x0000_8000;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(module_name: *const u16) -> isize;
+    }
 
     #[link(name = "user32")]
     extern "system" {
         fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
         fn SetForegroundWindow(hwnd: isize) -> i32;
+        fn LoadImageW(
+            hinst: isize,
+            name: usize,
+            r#type: u32,
+            cx: i32,
+            cy: i32,
+            fu_load: u32,
+        ) -> isize;
+        fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
     }
 
     fn hwnd_of(window: &Window) -> Option<isize> {
@@ -43,6 +63,23 @@ mod win32_window {
         match handle.as_raw() {
             RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
             _ => None,
+        }
+    }
+
+    pub fn apply_window_icon(window: &Window) {
+        let Some(hwnd) = hwnd_of(window) else {
+            return;
+        };
+        unsafe {
+            let hinst = GetModuleHandleW(std::ptr::null());
+            let big = LoadImageW(hinst, 1, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+            let small = LoadImageW(hinst, 1, IMAGE_ICON, 16, 16, LR_SHARED);
+            if big != 0 {
+                SendMessageW(hwnd, WM_SETICON, ICON_BIG, big);
+            }
+            if small != 0 {
+                SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small);
+            }
         }
     }
 
@@ -85,10 +122,13 @@ fn open_main_window(cx: &mut App) {
 
     if let Ok(handle) = cx.open_window(options, |window, cx| {
         #[cfg(target_os = "windows")]
-        window.on_window_should_close(cx, |window, _cx| {
-            win32_window::hide_to_tray(window);
-            false
-        });
+        {
+            win32_window::apply_window_icon(window);
+            window.on_window_should_close(cx, |window, _cx| {
+                win32_window::hide_to_tray(window);
+                false
+            });
+        }
         let _ = window;
         cx.new(|cx| MainView::new(tray, cx))
     }) {
