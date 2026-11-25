@@ -23,6 +23,48 @@ pub struct AppGlobal {
 
 impl Global for AppGlobal {}
 
+#[cfg(target_os = "windows")]
+mod win32_window {
+    use gpui::Window;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    const SW_HIDE: i32 = 0;
+    const SW_SHOW: i32 = 5;
+    const SW_RESTORE: i32 = 9;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
+        fn SetForegroundWindow(hwnd: isize) -> i32;
+    }
+
+    fn hwnd_of(window: &Window) -> Option<isize> {
+        let handle = HasWindowHandle::window_handle(window).ok()?;
+        match handle.as_raw() {
+            RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+            _ => None,
+        }
+    }
+
+    pub fn hide_to_tray(window: &Window) {
+        if let Some(hwnd) = hwnd_of(window) {
+            unsafe {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+    }
+
+    pub fn show_from_tray(window: &Window) {
+        if let Some(hwnd) = hwnd_of(window) {
+            unsafe {
+                ShowWindow(hwnd, SW_SHOW);
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            }
+        }
+    }
+}
+
 fn open_main_window(cx: &mut App) {
     let tray = cx
         .try_global::<AppGlobal>()
@@ -40,7 +82,15 @@ fn open_main_window(cx: &mut App) {
         ..Default::default()
     };
 
-    if let Ok(handle) = cx.open_window(options, |_window, cx| cx.new(|cx| MainView::new(tray, cx))) {
+    if let Ok(handle) = cx.open_window(options, |window, cx| {
+        #[cfg(target_os = "windows")]
+        window.on_window_should_close(cx, |window, _cx| {
+            win32_window::hide_to_tray(window);
+            false
+        });
+        let _ = window;
+        cx.new(|cx| MainView::new(tray, cx))
+    }) {
         let weak = handle
             .update(cx, |_view, window, cx| {
                 window.activate_window();
@@ -58,6 +108,8 @@ fn show_or_open_main_window(cx: &mut App) {
     cx.activate(true);
     if let Some(window_handle) = cx.windows().into_iter().next() {
         let _ = window_handle.update(cx, |_, window, _| {
+            #[cfg(target_os = "windows")]
+            win32_window::show_from_tray(window);
             window.activate_window();
         });
     } else {
