@@ -75,8 +75,9 @@ fn open_main_window(cx: &mut App) {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
             title: Some("AI Switcher".into()),
-            appears_transparent: true,
-            traffic_light_position: Some(point(px(14.0), px(16.0))),
+            appears_transparent: cfg!(target_os = "macos"),
+            traffic_light_position: cfg!(target_os = "macos")
+                .then_some(point(px(14.0), px(16.0))),
         }),
         window_min_size: Some(size(px(600.0), px(400.0))),
         ..Default::default()

@@ -39,7 +39,10 @@ impl TrayController {
         menu.append(&refresh_item).map_err(|e| e.to_string())?;
         menu.append(&quit_item).map_err(|e| e.to_string())?;
 
+        #[cfg(target_os = "macos")]
         let icon = build_template_icon()?;
+        #[cfg(target_os = "windows")]
+        let icon = build_windows_tray_icon()?;
 
         let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -172,13 +175,12 @@ fn dist_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 
     ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
 }
 
-/// 36x36 Retina 极简模板图标：双向切换箭头（⇄），与 App 图标一致
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// 36x36 macOS Retina 极简模板图标：双向切换箭头（⇄），与 App 图标一致
+#[cfg(target_os = "macos")]
 fn build_template_icon() -> Result<Icon, String> {
     let size = 36u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     let half_w = 1.65f32;
-    let fg: u8 = if cfg!(target_os = "macos") { 0 } else { 245 };
 
     let segments: [(f32, f32, f32, f32); 6] = [
         (7.5, 12.0, 28.5, 12.0),
@@ -206,12 +208,85 @@ fn build_template_icon() -> Result<Icon, String> {
             }
             let alpha = ((coverage / 16.0) * 255.0).round() as u8;
             let idx = ((y * size + x) * 4) as usize;
-            rgba[idx] = fg;
-            rgba[idx + 1] = fg;
-            rgba[idx + 2] = fg;
+            rgba[idx] = 0;
+            rgba[idx + 1] = 0;
+            rgba[idx + 2] = 0;
             rgba[idx + 3] = alpha;
         }
     }
 
     Icon::from_rgba(rgba, size, size).map_err(|e| format!("构建托盘图标失败: {e}"))
+}
+
+/// 32x32 Windows 标准彩色托盘图标：深石墨圆角底座 + 白/蓝双向箭头（深浅任务栏均清晰可见）
+#[cfg(target_os = "windows")]
+fn build_windows_tray_icon() -> Result<Icon, String> {
+    let size = 32u32;
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+    let half_w = 1.55f32;
+
+    let top_segments: [(f32, f32, f32, f32); 3] = [
+        (7.5, 11.2, 24.5, 11.2),
+        (19.5, 6.8, 24.5, 11.2),
+        (19.5, 15.6, 24.5, 11.2),
+    ];
+    let bot_segments: [(f32, f32, f32, f32); 3] = [
+        (24.5, 20.8, 7.5, 20.8),
+        (12.5, 16.4, 7.5, 20.8),
+        (12.5, 25.2, 7.5, 20.8),
+    ];
+
+    for y in 0..size {
+        for x in 0..size {
+            let mut r_acc = 0.0f32;
+            let mut g_acc = 0.0f32;
+            let mut b_acc = 0.0f32;
+            let mut a_acc = 0.0f32;
+
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = x as f32 + (sx as f32 + 0.5) / 4.0;
+                    let py = y as f32 + (sy as f32 + 0.5) / 4.0;
+
+                    // 圆角矩形底座 [1.5..30.5], radius = 6.5
+                    let cx = (px - 16.0).abs() - 8.0;
+                    let cy = (py - 16.0).abs() - 8.0;
+                    let rounded_dist = (cx.max(0.0).powi(2) + cy.max(0.0).powi(2)).sqrt()
+                        + cx.max(cy).min(0.0)
+                        - 6.5;
+
+                    if rounded_dist <= 0.0 {
+                        let hit_top = top_segments
+                            .iter()
+                            .any(|&(ax, ay, bx, by)| dist_to_segment(px, py, ax, ay, bx, by) <= half_w);
+                        let hit_bot = bot_segments
+                            .iter()
+                            .any(|&(ax, ay, bx, by)| dist_to_segment(px, py, ax, ay, bx, by) <= half_w);
+
+                        let (r, g, b) = if hit_top {
+                            (245.0, 248.0, 252.0)
+                        } else if hit_bot {
+                            (64.0, 158.0, 255.0)
+                        } else {
+                            (30.0, 34.0, 44.0)
+                        };
+                        r_acc += r;
+                        g_acc += g;
+                        b_acc += b;
+                        a_acc += 1.0;
+                    }
+                }
+            }
+
+            let idx = ((y * size + x) * 4) as usize;
+            if a_acc > 0.0 {
+                rgba[idx] = (r_acc / a_acc).round() as u8;
+                rgba[idx + 1] = (g_acc / a_acc).round() as u8;
+                rgba[idx + 2] = (b_acc / a_acc).round() as u8;
+                rgba[idx + 3] = ((a_acc / 16.0) * 255.0).round() as u8;
+            }
+        }
+    }
+
+    Icon::from_rgba(rgba, size, size).map_err(|e| format!("构建 Windows 托盘图标失败: {e}"))
 }
