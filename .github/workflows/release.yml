@@ -99,7 +99,18 @@ jobs:
           Copy-Item README.md upload/staging/README.md
           Compress-Archive -Path upload/staging/* -DestinationPath "upload/AI-Switcher-v${version}-windows-x86_64.zip" -Force
           Remove-Item -Recurse -Force upload/staging
-          makensis "/DAPP_VERSION=${version}" scripts/installer.nsi
+          $makensis = (Get-Command makensis -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)
+          if (-not $makensis -and (Test-Path "C:\Program Files (x86)\NSIS\makensis.exe")) {
+            $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          }
+          if (-not $makensis -and (Test-Path "C:\Program Files\NSIS\makensis.exe")) {
+            $makensis = "C:\Program Files\NSIS\makensis.exe"
+          }
+          if (-not $makensis) {
+            choco install nsis -y --no-progress
+            $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          }
+          & $makensis "/DAPP_VERSION=${version}" scripts/installer.nsi
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
