@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -11,7 +12,8 @@ use crate::models::{
     AntigravityIdeAccount, CodexAccount, Platform,
 };
 use crate::store::{
-    export_store_to_path, import_accounts_from_path, load_store, save_store, ImportSummary,
+    export_store_to_path, filter_store_for_export, import_accounts_from_path, load_store,
+    save_store, ImportSummary,
 };
 use crate::tray::TrayController;
 
@@ -100,12 +102,47 @@ pub fn refresh_store_quotas_blocking() -> Option<AccountStore> {
     Some(updated)
 }
 
+struct ExportSelection {
+    codex_ids: HashSet<String>,
+    antigravity_ids: HashSet<String>,
+    ide_ids: HashSet<String>,
+}
+
+impl ExportSelection {
+    fn select_all(store: &AccountStore) -> Self {
+        Self {
+            codex_ids: store.codex_accounts.iter().map(|a| a.id.clone()).collect(),
+            antigravity_ids: store
+                .antigravity_accounts
+                .iter()
+                .map(|a| a.id.clone())
+                .collect(),
+            ide_ids: store
+                .antigravity_ide_accounts
+                .iter()
+                .map(|a| a.id.clone())
+                .collect(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.codex_ids.clear();
+        self.antigravity_ids.clear();
+        self.ide_ids.clear();
+    }
+
+    fn selected_count(&self) -> usize {
+        self.codex_ids.len() + self.antigravity_ids.len() + self.ide_ids.len()
+    }
+}
+
 pub struct MainView {
     store: AccountStore,
     platform: Platform,
     busy: bool,
     status_message: String,
     tray: Option<Rc<TrayController>>,
+    export_modal: Option<ExportSelection>,
 }
 
 impl MainView {
@@ -123,6 +160,7 @@ impl MainView {
             busy: false,
             status_message: "就绪".to_string(),
             tray,
+            export_modal: None,
         };
         view.update_tray_title();
 
@@ -275,10 +313,99 @@ impl MainView {
         .detach();
     }
 
-    fn export_accounts(&mut self, cx: &mut Context<Self>) {
+    fn open_export_modal(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
+        let total = self.store.codex_accounts.len()
+            + self.store.antigravity_accounts.len()
+            + self.store.antigravity_ide_accounts.len();
+        if total == 0 {
+            self.status_message = "暂无可导出的账号".to_string();
+            cx.notify();
+            return;
+        }
+        self.export_modal = Some(ExportSelection::select_all(&self.store));
+        cx.notify();
+    }
+
+    fn toggle_export_account(&mut self, platform: Platform, id: &str, cx: &mut Context<Self>) {
+        let Some(sel) = self.export_modal.as_mut() else {
+            return;
+        };
+        let set = match platform {
+            Platform::Codex => &mut sel.codex_ids,
+            Platform::Antigravity => &mut sel.antigravity_ids,
+            Platform::AntigravityIde => &mut sel.ide_ids,
+        };
+        if !set.remove(id) {
+            set.insert(id.to_string());
+        }
+        cx.notify();
+    }
+
+    fn toggle_export_platform(&mut self, platform: Platform, cx: &mut Context<Self>) {
+        let Some(sel) = self.export_modal.as_mut() else {
+            return;
+        };
+        match platform {
+            Platform::Codex => {
+                if sel.codex_ids.len() == self.store.codex_accounts.len() {
+                    sel.codex_ids.clear();
+                } else {
+                    sel.codex_ids = self
+                        .store
+                        .codex_accounts
+                        .iter()
+                        .map(|a| a.id.clone())
+                        .collect();
+                }
+            }
+            Platform::Antigravity => {
+                if sel.antigravity_ids.len() == self.store.antigravity_accounts.len() {
+                    sel.antigravity_ids.clear();
+                } else {
+                    sel.antigravity_ids = self
+                        .store
+                        .antigravity_accounts
+                        .iter()
+                        .map(|a| a.id.clone())
+                        .collect();
+                }
+            }
+            Platform::AntigravityIde => {
+                if sel.ide_ids.len() == self.store.antigravity_ide_accounts.len() {
+                    sel.ide_ids.clear();
+                } else {
+                    sel.ide_ids = self
+                        .store
+                        .antigravity_ide_accounts
+                        .iter()
+                        .map(|a| a.id.clone())
+                        .collect();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn confirm_export_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(sel) = self.export_modal.take() else {
+            return;
+        };
+        let selected_count = sel.selected_count();
+        if selected_count == 0 {
+            self.export_modal = Some(sel);
+            return;
+        }
+        let store_snapshot = filter_store_for_export(
+            &self.store,
+            &sel.codex_ids,
+            &sel.antigravity_ids,
+            &sel.ide_ids,
+        );
+        cx.notify();
+
         let default_dir = dirs::desktop_dir()
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -287,7 +414,6 @@ impl MainView {
             chrono::Local::now().format("%Y%m%d")
         );
         let rx = cx.prompt_for_new_path(&default_dir, Some(&suggested));
-        let store_snapshot = self.store.clone();
 
         cx.spawn(async move |this, cx| {
             let selected = rx.await.ok().and_then(|res| res.ok()).flatten();
@@ -305,7 +431,8 @@ impl MainView {
             let _ = this.update(cx, |this, cx| {
                 match save_res {
                     Ok(saved) => {
-                        this.status_message = format!("已导出到 {}", saved.display());
+                        this.status_message =
+                            format!("已导出 {selected_count} 个账号到 {}", saved.display());
                     }
                     Err(err) => {
                         this.status_message = format!("导出失败: {err}");
@@ -1113,6 +1240,377 @@ impl MainView {
 
         card
     }
+
+    fn render_export_checkbox(checked: bool) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(16.0))
+            .h(px(16.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(rgb(if checked { ACCENT_BLUE } else { BORDER_SUBTLE }))
+            .bg(rgb(if checked { ACCENT_BLUE } else { BG_WINDOW }))
+            .text_xs()
+            .font_weight(FontWeight::BOLD)
+            .text_color(rgb(0xffffff))
+            .when(checked, |el| el.child("✓"))
+    }
+
+    fn render_export_group_header(
+        &self,
+        platform: Platform,
+        title: &str,
+        selected: usize,
+        total: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let all_selected = total > 0 && selected == total;
+        let id = match platform {
+            Platform::Codex => "export-group-codex",
+            Platform::Antigravity => "export-group-ag",
+            Platform::AntigravityIde => "export-group-ide",
+        };
+        div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .bg(rgb(BG_SURFACE))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_export_platform(platform, cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(Self::render_export_checkbox(all_selected))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .child(title.to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(format!("{selected}/{total}")),
+            )
+    }
+
+    fn render_export_account_row(
+        &self,
+        platform: Platform,
+        id: String,
+        label: String,
+        badge: Option<String>,
+        checked: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let row_id = SharedString::from(format!("export-row-{id}"));
+        let toggle_id = id.clone();
+        div()
+            .id(row_id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px(px(10.0))
+            .py(px(7.0))
+            .rounded(px(6.0))
+            .bg(rgb(if checked { BG_CARD_ACTIVE } else { BG_CARD }))
+            .border_1()
+            .border_color(rgb(if checked { BORDER_ACTIVE } else { BORDER_SUBTLE }))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_export_account(platform, &toggle_id, cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(Self::render_export_checkbox(checked))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .child(label),
+                    ),
+            )
+            .when_some(badge, |el, plan| {
+                el.child(
+                    div()
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded(px(4.0))
+                        .bg(rgb(0x2c303a))
+                        .text_xs()
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child(plan),
+                )
+            })
+    }
+
+    fn render_export_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(sel) = self.export_modal.as_ref() else {
+            return div().into_any_element();
+        };
+
+        let total_count = self.store.codex_accounts.len()
+            + self.store.antigravity_accounts.len()
+            + self.store.antigravity_ide_accounts.len();
+        let selected_count = sel.selected_count();
+
+        let mut body = div()
+            .id("export-modal-list")
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .px(px(16.0))
+            .py(px(12.0))
+            .overflow_y_scroll();
+
+        if !self.store.codex_accounts.is_empty() {
+            body = body.child(self.render_export_group_header(
+                Platform::Codex,
+                "Codex",
+                sel.codex_ids.len(),
+                self.store.codex_accounts.len(),
+                cx,
+            ));
+            for acc in &self.store.codex_accounts {
+                let checked = sel.codex_ids.contains(&acc.id);
+                let label = acc
+                    .email
+                    .clone()
+                    .unwrap_or_else(|| acc.account_id.clone());
+                let badge = acc.plan_type.as_ref().map(|p| p.to_uppercase());
+                body = body.child(self.render_export_account_row(
+                    Platform::Codex,
+                    acc.id.clone(),
+                    label,
+                    badge,
+                    checked,
+                    cx,
+                ));
+            }
+        }
+
+        if !self.store.antigravity_accounts.is_empty() {
+            body = body.child(self.render_export_group_header(
+                Platform::Antigravity,
+                "Antigravity",
+                sel.antigravity_ids.len(),
+                self.store.antigravity_accounts.len(),
+                cx,
+            ));
+            for acc in &self.store.antigravity_accounts {
+                let checked = sel.antigravity_ids.contains(&acc.id);
+                body = body.child(self.render_export_account_row(
+                    Platform::Antigravity,
+                    acc.id.clone(),
+                    acc.email.clone(),
+                    acc.plan_name.clone(),
+                    checked,
+                    cx,
+                ));
+            }
+        }
+
+        if !self.store.antigravity_ide_accounts.is_empty() {
+            body = body.child(self.render_export_group_header(
+                Platform::AntigravityIde,
+                "Antigravity IDE",
+                sel.ide_ids.len(),
+                self.store.antigravity_ide_accounts.len(),
+                cx,
+            ));
+            for acc in &self.store.antigravity_ide_accounts {
+                let checked = sel.ide_ids.contains(&acc.id);
+                body = body.child(self.render_export_account_row(
+                    Platform::AntigravityIde,
+                    acc.id.clone(),
+                    acc.email.clone(),
+                    acc.plan_name.clone(),
+                    checked,
+                    cx,
+                ));
+            }
+        }
+
+        div()
+            .id("export-modal-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(rgba(0x00000099))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.export_modal = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("export-modal-dialog")
+                    .w(px(460.0))
+                    .max_h(px(440.0))
+                    .flex()
+                    .flex_col()
+                    .rounded(px(12.0))
+                    .bg(rgb(BG_WINDOW))
+                    .border_1()
+                    .border_color(rgb(BORDER_SUBTLE))
+                    .on_click(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .px(px(16.0))
+                            .py(px(12.0))
+                            .border_b_1()
+                            .border_color(rgb(BORDER_SUBTLE))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("选择要导出的账号"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .id("export-select-all")
+                                            .px(px(8.0))
+                                            .py(px(3.0))
+                                            .rounded(px(5.0))
+                                            .bg(rgb(0x2b2f3a))
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.export_modal =
+                                                    Some(ExportSelection::select_all(&this.store));
+                                                cx.notify();
+                                            }))
+                                            .child("全选"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("export-clear-all")
+                                            .px(px(8.0))
+                                            .py(px(3.0))
+                                            .rounded(px(5.0))
+                                            .bg(rgb(0x2b2f3a))
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(sel) = this.export_modal.as_mut() {
+                                                    sel.clear();
+                                                }
+                                                cx.notify();
+                                            }))
+                                            .child("清空"),
+                                    ),
+                            ),
+                    )
+                    .child(body)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .px(px(16.0))
+                            .py(px(12.0))
+                            .border_t_1()
+                            .border_color(rgb(BORDER_SUBTLE))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .child(format!("已选 {selected_count} / {total_count} 个账号")),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .id("export-cancel")
+                                            .px(px(12.0))
+                                            .py(px(5.0))
+                                            .rounded(px(6.0))
+                                            .bg(rgb(0x2b2f3a))
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.export_modal = None;
+                                                cx.notify();
+                                            }))
+                                            .child("取消"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("export-confirm")
+                                            .px(px(12.0))
+                                            .py(px(5.0))
+                                            .rounded(px(6.0))
+                                            .bg(rgb(if selected_count > 0 {
+                                                ACCENT_BLUE
+                                            } else {
+                                                0x2b2f3a
+                                            }))
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(if selected_count > 0 {
+                                                0xffffff
+                                            } else {
+                                                TEXT_MUTED
+                                            }))
+                                            .when(selected_count > 0, |el| {
+                                                el.cursor_pointer().on_click(cx.listener(
+                                                    |this, _, _, cx| {
+                                                        this.confirm_export_selected(cx);
+                                                    },
+                                                ))
+                                            })
+                                            .child("导出所选"),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for MainView {
@@ -1286,7 +1784,7 @@ impl Render for MainView {
                             .text_color(rgb(TEXT_PRIMARY))
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.export_accounts(cx);
+                                this.open_export_modal(cx);
                             }))
                             .child("导出"),
                     )
@@ -1400,6 +1898,7 @@ impl Render for MainView {
             );
 
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -1408,5 +1907,8 @@ impl Render for MainView {
             .child(titlebar)
             .child(list)
             .child(footer)
+            .when(self.export_modal.is_some(), |el| {
+                el.child(self.render_export_modal(cx))
+            })
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
@@ -65,6 +66,49 @@ pub fn load_store() -> Result<AccountStore, String> {
 pub fn save_store(store: &AccountStore) -> Result<(), String> {
     let path = store_path()?;
     export_store_to_path(store, &path)
+}
+
+pub fn filter_store_for_export(
+    store: &AccountStore,
+    codex_ids: &HashSet<String>,
+    antigravity_ids: &HashSet<String>,
+    ide_ids: &HashSet<String>,
+) -> AccountStore {
+    AccountStore {
+        codex_accounts: store
+            .codex_accounts
+            .iter()
+            .filter(|a| codex_ids.contains(&a.id))
+            .cloned()
+            .collect(),
+        antigravity_accounts: store
+            .antigravity_accounts
+            .iter()
+            .filter(|a| antigravity_ids.contains(&a.id))
+            .cloned()
+            .collect(),
+        antigravity_ide_accounts: store
+            .antigravity_ide_accounts
+            .iter()
+            .filter(|a| ide_ids.contains(&a.id))
+            .cloned()
+            .collect(),
+        active_codex_id: store
+            .active_codex_id
+            .as_ref()
+            .filter(|id| codex_ids.contains(*id))
+            .cloned(),
+        active_antigravity_id: store
+            .active_antigravity_id
+            .as_ref()
+            .filter(|id| antigravity_ids.contains(*id))
+            .cloned(),
+        active_antigravity_ide_id: store
+            .active_antigravity_ide_id
+            .as_ref()
+            .filter(|id| ide_ids.contains(*id))
+            .cloned(),
+    }
 }
 
 pub fn export_store_to_path(store: &AccountStore, path: &Path) -> Result<(), String> {
@@ -452,5 +496,42 @@ mod tests {
         assert_eq!(acc.plan_type.as_deref(), Some("plus"));
         assert_eq!(acc.auth_json["auth_mode"], "chatgpt");
         assert_eq!(acc.auth_json["tokens"]["refresh_token"], "rt.1.test");
+    }
+
+    #[test]
+    fn filters_selected_accounts_for_export() {
+        let mut store = AccountStore::default();
+        store.codex_accounts.push(CodexAccount {
+            id: "c1".into(),
+            email: Some("a@example.com".into()),
+            account_id: "acc-1".into(),
+            plan_type: None,
+            auth_json: json!({}),
+            usage: None,
+            usage_error: None,
+            updated_at: 1,
+        });
+        store.codex_accounts.push(CodexAccount {
+            id: "c2".into(),
+            email: Some("b@example.com".into()),
+            account_id: "acc-2".into(),
+            plan_type: None,
+            auth_json: json!({}),
+            usage: None,
+            usage_error: None,
+            updated_at: 2,
+        });
+        store.active_codex_id = Some("c2".into());
+
+        let codex_ids: HashSet<String> = ["c1".to_string()].into_iter().collect();
+        let filtered = filter_store_for_export(
+            &store,
+            &codex_ids,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(filtered.codex_accounts.len(), 1);
+        assert_eq!(filtered.codex_accounts[0].id, "c1");
+        assert_eq!(filtered.active_codex_id, None);
     }
 }
