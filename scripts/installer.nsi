@@ -1,4 +1,4 @@
-!include "MUI2.nsh"
+﻿!include "MUI2.nsh"
 
 !ifndef APP_VERSION
   !define APP_VERSION "0.1.7"
