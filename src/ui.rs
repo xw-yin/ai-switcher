@@ -16,6 +16,7 @@ use crate::store::{
     save_store, ImportSummary,
 };
 use crate::tray::TrayController;
+use crate::update::{self, AvailableUpdate};
 
 fn tokio_rt() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -143,6 +144,9 @@ pub struct MainView {
     status_message: String,
     tray: Option<Rc<TrayController>>,
     export_modal: Option<ExportSelection>,
+    available_update: Option<AvailableUpdate>,
+    update_busy: bool,
+    update_message: String,
 }
 
 impl MainView {
@@ -161,6 +165,9 @@ impl MainView {
             status_message: "就绪".to_string(),
             tray,
             export_modal: None,
+            available_update: None,
+            update_busy: false,
+            update_message: String::new(),
         };
         view.update_tray_title();
 
@@ -173,6 +180,60 @@ impl MainView {
         .detach();
 
         view
+    }
+
+    fn check_for_update(&mut self, cx: &mut Context<Self>) {
+        if self.update_busy {
+            return;
+        }
+        self.update_busy = true;
+        self.available_update = None;
+        self.update_message = "正在检查更新…".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = tokio_rt().spawn(update::check()).await;
+            let _ = this.update(cx, |this, cx| {
+                this.update_busy = false;
+                this.update_message = match result {
+                    Ok(Ok(update)) => {
+                        this.available_update = update;
+                        match &this.available_update {
+                            Some(update) => format!("发现新版本 {}", update.tag),
+                            None => "已是最新正式版".into(),
+                        }
+                    }
+                    Ok(Err(error)) => format!("检查更新失败：{error}"),
+                    Err(error) => format!("检查更新失败：{error}"),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_update(&mut self, cx: &mut Context<Self>) {
+        if self.update_busy {
+            return;
+        }
+        let Some(update) = self.available_update.clone() else {
+            return;
+        };
+        self.update_busy = true;
+        self.update_message = "正在准备更新…".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = tokio_rt().spawn(update.open()).await;
+            let _ = this.update(cx, |this, cx| {
+                this.update_busy = false;
+                this.update_message = match result {
+                    Ok(Ok(message)) => message.into(),
+                    Ok(Err(error)) => format!("更新失败：{error}"),
+                    Err(error) => format!("更新失败：{error}"),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn update_tray_title(&self) {
@@ -1897,6 +1958,52 @@ impl Render for MainView {
                     .child("GPUI · 60s 自动轮询"),
             );
 
+        let update_bar = div()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(16.0))
+            .h(px(32.0))
+            .flex_shrink_0()
+            .bg(rgb(BG_SURFACE))
+            .border_t_1()
+            .border_color(rgb(BORDER_SUBTLE))
+            .text_xs()
+            .text_color(rgb(TEXT_SECONDARY))
+            .child(format!("AI Switcher v{}", update::CURRENT_VERSION))
+            .child(
+                div()
+                    .id("check-update")
+                    .text_color(rgb(if self.update_busy {
+                        TEXT_MUTED
+                    } else {
+                        ACCENT_BLUE
+                    }))
+                    .when(!self.update_busy, |button| button.cursor_pointer())
+                    .on_click(cx.listener(|this, _, _, cx| this.check_for_update(cx)))
+                    .child("检查更新"),
+            )
+            .when_some(
+                self.available_update.as_ref().filter(|_| !self.update_busy),
+                |bar, update| {
+                    bar.child(
+                        div()
+                            .id("open-update")
+                            .text_color(rgb(ACCENT_BLUE))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.open_update(cx)))
+                            .child(update.action_label()),
+                    )
+                },
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .child(self.update_message.clone()),
+            );
+
         div()
             .relative()
             .flex()
@@ -1907,6 +2014,7 @@ impl Render for MainView {
             .child(titlebar)
             .child(list)
             .child(footer)
+            .child(update_bar)
             .when(self.export_modal.is_some(), |el| {
                 el.child(self.render_export_modal(cx))
             })
